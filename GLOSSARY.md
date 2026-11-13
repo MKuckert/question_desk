@@ -27,8 +27,8 @@ _Avoid_: form, batch, request.
 
 **Cancel** — the user abandons a Question Round (after confirmation); the partial Answers are delivered with status `cancelled`.
 
-**Ticket** — the identifier of a Question Round, returned to the Agent so it can Pick Up the result later.
+**Ticket** — the identifier of a Question Round, chosen by the Agent in the `ask_user_question` call so it can Pick Up the result later even if the call is dropped.
 
-**Pickup** — retrieving a Question Round's result via `wait_for_answers(ticket)` after the original blocking call was lost (timeout, disconnect).
+**Pickup** — retrieving a Question Round's result after the original blocking call was lost (timeout, disconnect), via `wait_for_answers(ticket)` or by repeating the `ask_user_question` call with the same Ticket.
 
 **Heartbeat** — the MCP progress notification the server sends periodically while a blocking call waits for the user, to keep client idle timeouts from firing.

@@ -8,7 +8,7 @@ Agents already know the built-in AskUserQuestion tool (1–4 questions, 2–4 op
 
 ## Decision
 
-Keep every AskUserQuestion field name and meaning, lift the count limits (any number of Questions, 0..n Options), and add optional `body` (Markdown), `recommended` (per Question), and `title` / `source` (per call). Validate strictly; invalid input is rejected as a tool error with a precise, correctable message (duplicate question texts or labels, empty question list, `multiSelect` without Options, …).
+Keep every AskUserQuestion field name and meaning, lift the count limits (any number of Questions, 0..n Options), and add optional `body` (Markdown), `recommended` (per Question), and `title` / `source` (per call). One added field is required: the Agent-chosen `ticket` (per call; see ADR 0003, revised after spike 2). Validate strictly; invalid input is rejected as a tool error with a precise, correctable message (duplicate question texts or labels, empty question list, `multiSelect` without Options, …).
 
 Output: `structuredContent` with `answers` and `annotations` (notes) keyed by question text like the original, plus `status` (`answered` | `cancelled`) and `ticket`. The text content uses the original one-line shape for short answers and switches to a per-question Markdown block format when an answer is multi-line or long. Markdown is generated with a library (`pulldown-cmark-to-cmark`), never by string concatenation.
 
@@ -16,4 +16,5 @@ Output: `structuredContent` with `answers` and `annotations` (notes) keyed by qu
 
 - Agents that know AskUserQuestion use the tool correctly without extra instruction.
 - Question text must be unique within a Question Round.
+- A call written exactly like AskUserQuestion fails validation until the Agent adds a `ticket`; the error message says so.
 - The text format is ours to define; snapshot tests pin it.

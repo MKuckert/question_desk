@@ -16,5 +16,5 @@ Security: an optional static bearer token (configured in the app's config file, 
 
 - One process owns all Question Rounds; concurrency and the sidebar come naturally.
 - If the app is not running, the Agent's MCP server is simply unavailable.
-- Stateless mode lets the server notice client disconnects (cancellation fires), but `clientInfo` is only available from clients speaking protocol 2026-07-28 or later; older clients show as "Unknown client" unless they pass `source`.
+- Stateless mode lets the server notice client disconnects (cancellation fires), but `clientInfo` is only available from clients speaking protocol 2026-07-28 or later, which send it (optionally) in each request's `_meta`; read it with rmcp's `RequestContext::client_info()`, never `peer_info()` (a placeholder in stateless mode). Older clients show as "Unknown client" unless they pass `source`. Claude Code 2.1.311 speaks 2026-07-28 and sends `clientInfo` (spike 2).
 - The sandbox profile needs network access to localhost only.

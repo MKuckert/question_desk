@@ -30,7 +30,7 @@ The app shows each Question Round in a large, focused window: one Question at a 
 10. As an Agent, I want to pass an optional `title` for the Question Round, so that the user knows what the round is about.
 11. As an Agent, I want to pass an optional `source` (e.g. project name or working directory), so that the user can tell my rounds apart from other Agents'.
 12. As an Agent, I want invalid input (duplicate question texts, duplicate Option labels, empty question list, `multiSelect` without Options, missing required fields) to be rejected immediately with a precise error, so that I can correct my call instead of confusing the user.
-13. As an Agent, I want the tool description to explain how to use the tool well (bundle related Questions, put context in `body`, always give a Recommendation), so that I produce good grilling rounds without extra prompting.
+13. As an Agent, I want the tool description to explain how to use the tool well (bundle related Questions, put context in `body`, always give a Recommendation, choose a unique Ticket and reuse it after a dropped call), so that I produce good grilling rounds without extra prompting.
 
 ### Receiving answers (Agent side)
 
@@ -42,8 +42,8 @@ The app shows each Question Round in a large, focused window: one Question at a 
 19. As an Agent, I want Unanswered Questions to be explicitly marked as unanswered, so that I can follow up on them.
 20. As an Agent, I want a Cancelled Question Round to return status `cancelled` with the partial Answers, so that I can react sensibly and not lose what the user already answered.
 21. As an Agent, I want Heartbeat progress notifications while I wait, so that my client's idle timeout does not abort the call.
-22. As an Agent, I want every Question Round to have a Ticket, so that I can retrieve the result later if my call was dropped.
-23. As an Agent, I want to call `wait_for_answers(ticket)` and get either the result or "still pending" within about 50 seconds, so that I can poll robustly when long blocking calls are not possible.
+22. As an Agent, I want to choose the Ticket of a Question Round myself, and have a repeated `ask_user_question` with the same Ticket reattach to that round, so that I can recover from a dropped call without asking the user twice.
+23. As an Agent, I want to call `wait_for_answers(ticket)` and get either the result or "still pending" (with the round's title and question texts) within about 50 seconds, so that I can poll robustly when long blocking calls are not possible and confirm the round is mine.
 24. As an Agent, I want an unknown Ticket to produce a clear error, so that I don't loop forever.
 
 ### Connecting and security
@@ -119,7 +119,7 @@ Architecture and technology are recorded in ADRs; this section does not repeat t
 
 - **ADR 0001**: long-running GUI app outside the sandbox, embedded stateless Streamable HTTP MCP server on `127.0.0.1`, optional bearer token, reject any `Origin`.
 - **ADR 0002**: `rmcp` mounted in `axum`; no hand-rolled MCP.
-- **ADR 0003**: blocking `ask_user_question` with Heartbeat (~15 s), Ticket per round, `wait_for_answers(ticket)` (~50 s) for Pickup.
+- **ADR 0003** (revised after spike 2): blocking `ask_user_question` with Heartbeat (~15 s), Agent-chosen Ticket per round, reattach on repeated calls, `wait_for_answers(ticket)` (~50 s) for Pickup.
 - **ADR 0004**: input schema is a superset of AskUserQuestion; output keeps its shape; strict validation; Markdown output generated with `pulldown-cmark-to-cmark`.
 - **ADR 0005**: `eframe`/`egui` 0.37 with `egui_commonmark` and `egui_system_font_provider`; color emoji is a hard gate verified by a spike first.
 
@@ -129,7 +129,7 @@ One binary crate, with a library target so tests and the demo client can use it.
 
 - **schema** — serde types for the tool input and output (`JsonSchema` derived for MCP schemas) and strict validation. JSON is parsed only via `serde_json`/rmcp, never by hand.
 - **desk** (the core) — owns all Question Rounds and Agent Sessions. Deep module with a small interface:
-  - Agent side: open a Question Round (returns Ticket and a future resolving to the result), await a result by Ticket with a deadline, mark a round's Agent as disconnected.
+  - Agent side: open or reattach to a Question Round by Ticket (returns a future resolving to the result; error if the Ticket is known with different Questions), await a result by Ticket with a deadline, mark a round's Agent as disconnected.
   - User side (the same intents the UI triggers): list rounds grouped by Agent Session with progress; select a round; go to Question n / next / back / Review Page; toggle Option; set Note; accept Recommendation; Submit; Cancel.
   - Read model for the UI: current round, current Question, per-Question state (open / answered / current), Unanswered list, connection indicator.
   - Thread-safe; notifies the UI to repaint on changes. No egui and no HTTP types in its interface.
@@ -141,24 +141,25 @@ One binary crate, with a library target so tests and the demo client can use it.
 
 ### Tool contract (summary)
 
-- `ask_user_question` input: `questions[]` (each: `question`, `header`, optional `body`, `options[]` with `label`, `description`, optional `preview`; `multiSelect`; optional `recommended`), optional `title`, optional `source`.
+- `ask_user_question` input: required `ticket` (Agent-chosen; short, `[A-Za-z0-9._-]`), `questions[]` (each: `question`, `header`, optional `body`, `options[]` with `label`, `description`, optional `preview`; `multiSelect`; optional `recommended`), optional `title`, optional `source`.
 - Output `structuredContent`: `status` (`answered` | `cancelled`), `ticket`, `answers` (question text → answer string; multiple selections comma-joined like the original), `annotations` (question text → `{ notes }`), `unanswered` (list of question texts).
-- `wait_for_answers` input: `ticket`. Output: the same result, or `status: pending`.
+- `wait_for_answers` input: `ticket`. Output: the same result, or `status: pending` with `title` and `questions` (question texts).
+- A repeated `ask_user_question` with a known Ticket and identical Questions reattaches (blocks, or returns the finished result); with different Questions it is a tool error.
 - Validation failures and unknown Tickets: tool error (`isError: true`) with a precise message.
-- Agent Session label: `clientInfo.name` (when available) + `source`; fallback "Unknown client".
+- Agent Session label: `clientInfo.title`, else `clientInfo.name` (from the request `_meta`, when available), + `source`; fallback "Unknown client". Claude Code sends `{"name": "claude-code", "title": "Claude Code", ...}`.
 
 ### Behaviour details
 
 - Recommendation is never pre-selected. If it equals an Option label, that Option is badged; otherwise it is shown as text.
 - An Answer is the selected Option label(s); if none selected and the Note is non-empty, the Note text is the Answer; otherwise the Question is Unanswered.
 - Submit with Unanswered Questions shows a warning first. Cancel and window close with open rounds ask for confirmation.
-- A dropped call leaves the round visible and answerable; the submitted result is kept in memory until picked up or the app quits.
+- A dropped call leaves the round visible and answerable; rounds and results are kept in memory until the app quits.
 - On a new round: bring window to front and request user attention; do not take keyboard focus.
 
 ### Delivery order
 
 1. Spike: color emoji, emoji picker input, umlauts/IME in egui 0.37 on macOS (gate for ADR 0005).
-2. Spike: multi-minute blocking call with Heartbeat in Claude Code over HTTP; check idle timeout, auto-backgrounding after 2 min, and whether denying `AskUserQuestion` disables the built-in tool; simple disconnect indicator.
+2. Spike: multi-minute blocking call with Heartbeat in Claude Code over HTTP; check idle timeout, auto-backgrounding after 2 min, and whether denying `AskUserQuestion` disables the built-in tool; simple disconnect indicator. Done (2026-11-13): see `spikes/02-mcp-heartbeat/README.md` and the revised ADR 0003.
 3. MVP: schema → format → desk → server → config → ui → demo client → README.
 
 ## Testing Decisions
@@ -168,7 +169,7 @@ One binary crate, with a library target so tests and the demo client can use it.
   - the Agent side through a real rmcp client over HTTP (`ask_user_question`, `wait_for_answers`), and
   - the user side through the `desk` user intents (select round, toggle Option, set Note, navigate, jump, Submit, Cancel).
 
-  Through this seam we cover: the full answer flow; multiSelect; Note-as-Answer; Recommendation acceptance; Unanswered on Submit; Cancel with partial Answers; validation errors as tool errors; unknown Ticket; Pickup after the blocking call is dropped; Heartbeat notifications being sent; disconnect indicator; concurrent rounds from different Agent Sessions and switching between them; bearer token (401) and Origin rejection (403).
+  Through this seam we cover: the full answer flow; reattach with a repeated call; Ticket reuse with different Questions; multiSelect; Note-as-Answer; Recommendation acceptance; Unanswered on Submit; Cancel with partial Answers; validation errors as tool errors; unknown Ticket; Pickup after the blocking call is dropped; Heartbeat notifications being sent; disconnect indicator; concurrent rounds from different Agent Sessions and switching between them; bearer token (401) and Origin rejection (403).
 - **Secondary seam — `format` snapshot tests** (`insta`): text output edge cases that would be clumsy through the primary seam: long and multi-line Answers, Markdown escaping of hostile text, emoji, cancelled rounds, Unanswered lists.
 - **Interactive acceptance via the demo client**: run the Question Desk, then the demo client; it sends realistic rounds that appear in the real GUI, I answer them, and the client prints what the Agent receives. This is how the GUI itself is tested in the MVP; no protocol mocking needed.
 - **Not automated in the MVP**: egui rendering, layout, emoji, IME, focus behaviour — covered by the spike and the demo client. `egui_kittest` UI tests come after the MVP.
@@ -177,7 +178,8 @@ One binary crate, with a library target so tests and the demo client can use it.
 
 ## Out of Scope
 
-- History of past Question Rounds and export of Answers (planned after MVP; also covers results lost when the app quits before Pickup).
+- Persisting Question Rounds and results across app restarts (required after the MVP; until then they are lost when the app quits).
+- History of past Question Rounds and export of Answers (planned after MVP).
 - Tray / menu bar icon, hiding the window when idle, login item / autostart.
 - CORS and any browser-based client.
 - stdio transport.
@@ -190,6 +192,6 @@ One binary crate, with a library target so tests and the demo client can use it.
 ## Further Notes
 
 - The exact AskUserQuestion result text is not officially documented; the one-line shape comes from an observed transcript. Our format is defined by this spec and pinned by snapshot tests.
-- Claude Code facts that shaped the design (from its docs, to be confirmed in spike 2): `MCP_TOOL_TIMEOUT` default ~28 h; `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` default 5 min for HTTP (progress notifications count as activity); `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` default 2 min; built-in tool presumably disabled via `permissions.deny: ["AskUserQuestion"]` or `--disallowedTools AskUserQuestion`.
+- Claude Code facts that shaped the design (docs): `MCP_TOOL_TIMEOUT` default ~28 h; `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` default 5 min for HTTP; `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` default 2 min. Spike 2 (Claude Code 2.1.311) confirmed: progress notifications are required (without them the call timed out after ~3 min; SSE keep-alive does not count), calls move to the background after 2 min and still deliver, and `permissions.deny: ["AskUserQuestion"]` or `--disallowedTools AskUserQuestion` disables the built-in tool (without it Claude Code prefers the built-in tool).
 - In the nono sandbox, `GIT_CONFIG_GLOBAL` from the profile is not present in the Agent's shell; git commands need it set explicitly.
 - Toolchain: Rust 1.99 available; `eframe`/`egui_commonmark` need MSRV 1.95, `rmcp` 1.88.
