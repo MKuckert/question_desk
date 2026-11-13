@@ -1,0 +1,17 @@
+[package]
+name = "spike-mcp-heartbeat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Throwaway spike for ADR 0003; not part of the Question Desk crate.
+[workspace]
+
+[dependencies]
+axum = "0.8"
+futures-util = "0.3"
+rmcp = { version = "3.9", features = ["server", "transport-streamable-http-server"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = { version = "0.1", features = ["log"] }
+env_logger = "0.11"
