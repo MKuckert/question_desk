@@ -7,6 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{
+    extract::{Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::common::{schema_for_output, schema_for_type},
@@ -82,7 +88,9 @@ pub async fn start(desk: Desk, settings: ServerSettings) -> std::io::Result<Runn
     let config = StreamableHttpServerConfig::default().with_legacy_session_mode(false);
     let service: StreamableHttpService<Handler, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(handler.clone()), Default::default(), config);
-    let app = axum::Router::new().nest_service("/mcp", service);
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(settings.clone(), guard));
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", settings.port)).await?;
     let addr = listener.local_addr()?;
@@ -92,6 +100,21 @@ pub async fn start(desk: Desk, settings: ServerSettings) -> std::io::Result<Runn
         }
     });
     Ok(RunningServer { addr, task })
+}
+
+/// Rejects browsers (any `Origin` header, 403) and clients without the bearer token (401).
+async fn guard(State(settings): State<Arc<ServerSettings>>, request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    if headers.contains_key(header::ORIGIN) {
+        return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
+    }
+    if let Some(token) = &settings.bearer_token {
+        let expected = format!("Bearer {token}");
+        if headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) != Some(&expected) {
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+    next.run(request).await
 }
 
 #[derive(Clone)]
@@ -111,9 +134,35 @@ fn tools() -> Vec<Tool> {
     vec![ask, wait]
 }
 
-const ASK_DESCRIPTION: &str = "Ask the user one or more questions and wait for the answers.";
+const ASK_DESCRIPTION: &str = "\
+Ask the user questions in the Question Desk window and wait for the answers. Use it instead of \
+the built-in AskUserQuestion; the fields are the same, without its limits.
 
-const WAIT_DESCRIPTION: &str = "Pick up the answers of a question round by its ticket.";
+How to ask well:
+- Bundle all related decisions into one call: any number of `questions`, each with any number \
+of `options` (zero options for an open question answered in free text).
+- Put context, trade-offs and consequences into the question's `body` (Markdown). Keep \
+`question` a single clear sentence and `header` a short chip label.
+- Always set `recommended` to your suggested answer: an option label, or free text for a \
+nuanced recommendation.
+- Use `multiSelect` when several options can apply; give options a `preview` (code, mockup) \
+when the user should compare artifacts.
+- Set `title` (what the round is about) and `source` (project or working directory).
+
+Tickets: `ticket` is required. Choose a short, unique id with a random suffix, e.g. \
+`db-choice-7f3`. This call blocks until the user submits or cancels, which can take many \
+minutes. If the call is interrupted or times out, do not ask again with a new ticket: call \
+`wait_for_answers` with the same ticket (or repeat this exact call) to pick up the answers.
+
+The result has the AskUserQuestion shape, plus `structuredContent` with `status` \
+(`answered` | `cancelled`), `answers`, `annotations` (the user's notes) and `unanswered`. \
+The user may leave questions unanswered or cancel; follow up on those instead of guessing.";
+
+const WAIT_DESCRIPTION: &str = "\
+Pick up the answers of a question round by the ticket you chose in `ask_user_question`, \
+after that call was interrupted or timed out. Blocks up to about 50 seconds and returns the \
+answers, or status `pending` with the round's title and questions so you can confirm it is \
+yours; call it again while pending. An unknown ticket is an error.";
 
 fn tool_error(message: impl Into<String>) -> CallToolResponse {
     CallToolResult::error(vec![ContentBlock::text(message.into())]).into()
@@ -156,13 +205,10 @@ impl ServerHandler for Handler {
 
 impl Handler {
     async fn ask(&self, args: Value, context: RequestContext<RoleServer>) -> CallToolResponse {
-        let input: AskInput = match schema::parse(args) {
+        let input = match schema::parse_ask(args) {
             Ok(input) => input,
             Err(e) => return tool_error(e),
         };
-        if let Err(e) = input.validate() {
-            return tool_error(e);
-        }
         // Only the per-request `_meta` identifies the client; in stateless mode the peer
         // info is a placeholder (ADR 0001).
         let client = context.meta.client_info().map(|c| c.title.unwrap_or(c.name));

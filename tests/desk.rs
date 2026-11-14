@@ -4,7 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use question_desk::{
-    desk::Desk,
+    desk::{Desk, QuestionState, RoundSummary, Step},
     server::{self, RunningServer, ServerSettings},
 };
 use rmcp::{
@@ -15,7 +15,7 @@ use rmcp::{
     },
     service::{ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService},
     transport::{
-        StreamableHttpClientTransport,
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde_json::{Value, json};
@@ -73,9 +73,13 @@ impl Harness {
     }
 
     async fn agent_as(&self, agent: Agent) -> RunningService<RoleClient, Agent> {
+        Self::agent_at(&self.url(), agent).await
+    }
+
+    async fn agent_at(url: &str, agent: Agent) -> RunningService<RoleClient, Agent> {
         // Like Claude Code: `server/discover` on protocol 2026-07-28, so the client's
         // identity travels in each request's `_meta`.
-        let transport = StreamableHttpClientTransport::from_uri(self.url());
+        let transport = StreamableHttpClientTransport::from_uri(url.to_owned());
         let lifecycle =
             ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] };
         agent.serve_with_lifecycle(transport, lifecycle).await.expect("agent connects")
@@ -83,10 +87,17 @@ impl Harness {
 
     /// Waits until the desk shows an open round with this Ticket, and selects it.
     async fn select(&self, ticket: &str) {
+        self.appeared(ticket).await;
+        self.desk.select(ticket);
+    }
+
+    /// Waits until the desk shows an open round with this Ticket.
+    async fn appeared(&self, ticket: &str) -> RoundSummary {
         for _ in 0..200 {
-            if self.desk.sessions().iter().flat_map(|s| &s.rounds).any(|r| r.ticket == ticket) {
-                self.desk.select(ticket);
-                return;
+            if let Some(round) =
+                self.desk.sessions().into_iter().flat_map(|s| s.rounds).find(|r| r.ticket == ticket)
+            {
+                return round;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -462,4 +473,183 @@ async fn concurrent_rounds_are_grouped_by_agent_session() {
             ("codex".to_owned(), vec!["b1".to_owned()]),
         ]
     );
+}
+
+fn three_questions(ticket: &str) -> Value {
+    let options = json!([{ "label": "Yes", "description": "" }, { "label": "No", "description": "" }]);
+    json!({ "ticket": ticket, "questions": [
+        { "question": "First?", "header": "1", "options": options },
+        { "question": "Second?", "header": "2", "options": options },
+        { "question": "Third?", "header": "3", "options": options }
+    ] })
+}
+
+fn states(desk: &Desk) -> Vec<QuestionState> {
+    desk.current().expect("a round is selected").questions.iter().map(|q| q.state).collect()
+}
+
+#[tokio::test]
+async fn the_user_moves_freely_through_a_round_and_reviews_it() {
+    use QuestionState::{Answered, Current, Open};
+    let h = start().await;
+    let agent = h.agent().await;
+    let _call = tokio::spawn(async move { call(&agent, "ask_user_question", three_questions("nav")).await });
+    h.select("nav").await;
+
+    assert_eq!(h.desk.current().unwrap().step, Step::Question(0));
+    assert_eq!(states(&h.desk), [Current, Open, Open]);
+    h.desk.toggle_option(0);
+    h.desk.next();
+    assert_eq!(states(&h.desk), [Answered, Current, Open]);
+    h.desk.go_to(2);
+    h.desk.back();
+    assert_eq!(h.desk.current().unwrap().step, Step::Question(1));
+    h.desk.back();
+    h.desk.back();
+    assert_eq!(h.desk.current().unwrap().step, Step::Question(0), "back stops at the first question");
+
+    h.desk.review();
+    let review = h.desk.current().unwrap();
+    assert_eq!(review.step, Step::Review);
+    assert_eq!(states(&h.desk), [Answered, Open, Open]);
+    assert_eq!(review.unanswered(), ["Second?", "Third?"]);
+    h.desk.next();
+    assert_eq!(h.desk.current().unwrap().step, Step::Review, "next stops at the Review Page");
+    h.desk.back();
+    assert_eq!(h.desk.current().unwrap().step, Step::Question(2));
+
+    let summary = &h.desk.sessions()[0].rounds[0];
+    assert_eq!((summary.answered, summary.total), (1, 3));
+}
+
+#[tokio::test]
+async fn the_recommendation_is_shown_never_preselected_and_accepted_on_request() {
+    let h = start().await;
+    let agent = h.agent().await;
+    let options = json!([{ "label": "Yes", "description": "" }, { "label": "No", "description": "" }]);
+    let args = json!({ "ticket": "rec", "questions": [
+        { "question": "Badge?", "header": "1", "options": options, "recommended": "No" },
+        { "question": "Text?", "header": "2", "options": options, "recommended": "Yes, but only on Fridays" },
+        { "question": "Mine?", "header": "3", "options": options, "recommended": "Yes" },
+        { "question": "None?", "header": "4", "options": options }
+    ] });
+    let call = tokio::spawn(async move { call(&agent, "ask_user_question", args).await });
+    h.select("rec").await;
+
+    let view = h.desk.current().unwrap();
+    let badge = &view.questions[0];
+    assert_eq!(badge.options.iter().map(|o| o.recommended).collect::<Vec<_>>(), [false, true]);
+    assert!(badge.options.iter().all(|o| !o.selected), "never pre-selected");
+    assert_eq!(badge.recommendation_text, None);
+    assert_eq!(view.questions[1].recommendation_text.as_deref(), Some("Yes, but only on Fridays"));
+    assert!(view.questions[1].options.iter().all(|o| !o.recommended));
+
+    h.desk.accept_recommendation();
+    h.desk.accept_recommendation();
+    h.desk.toggle_option(1);
+    h.desk.accept_recommendation();
+    assert_eq!(h.desk.current().unwrap().step, Step::Question(3), "accepting moves on");
+    h.desk.accept_recommendation();
+    h.desk.submit();
+
+    let result = call.await.unwrap();
+    assert_eq!(
+        result.structured_content.unwrap()["answers"],
+        json!({ "Badge?": "No", "Text?": "Yes, but only on Fridays", "Mine?": "No" })
+    );
+}
+
+#[tokio::test]
+async fn the_user_switches_between_rounds_without_losing_input() {
+    let h = start().await;
+    let ask = |ticket: &'static str| {
+        let h_url = h.url();
+        async move {
+            let agent = Harness::agent_at(&h_url, Agent::default()).await;
+            tokio::spawn(async move { call(&agent, "ask_user_question", db_round(ticket)).await })
+        }
+    };
+    let first = ask("first").await;
+    h.appeared("first").await;
+    assert_eq!(h.desk.current().unwrap().ticket, "first", "an idle desk shows a new round at once");
+    let _second = ask("second").await;
+    let second = h.appeared("second").await;
+    assert!(second.new, "a round the user has not looked at yet is badged");
+    assert!(!h.desk.sessions()[0].rounds[0].new);
+
+    h.desk.toggle_option(1);
+    h.desk.next();
+    h.desk.set_note("Später 🙂");
+    h.desk.select("second");
+    assert!(!h.appeared("second").await.new);
+    h.desk.toggle_option(0);
+    h.desk.select("first");
+
+    let view = h.desk.current().unwrap();
+    assert_eq!(view.step, Step::Question(1));
+    assert_eq!(view.questions[0].answer.as_deref(), Some("SQLite"));
+    assert_eq!(view.questions[1].note, "Später 🙂");
+
+    h.desk.submit();
+    assert_eq!(first.await.unwrap().structured_content.unwrap()["answers"]["Anything else?"], json!("Später 🙂"));
+    let view = h.desk.current().expect("the next open round is shown");
+    assert_eq!(view.ticket, "second");
+    assert_eq!(view.questions[0].answer.as_deref(), Some("Postgres"));
+}
+
+#[tokio::test]
+async fn only_clients_with_the_bearer_token_and_without_an_origin_get_in() {
+    let h = start_with(ServerSettings { bearer_token: Some("s3cret".into()), ..ServerSettings::default() }).await;
+    let http = reqwest::Client::new();
+    let post = |auth: Option<&str>, origin: Option<&str>| {
+        let mut request = http
+            .post(h.url())
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        if let Some(auth) = auth {
+            request = request.header("authorization", auth);
+        }
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        async move { request.send().await.expect("request is answered").status().as_u16() }
+    };
+    assert_eq!(post(None, None).await, 401);
+    assert_eq!(post(Some("Bearer wrong"), None).await, 401);
+    assert_eq!(post(Some("Bearer s3cret"), Some("https://evil.example")).await, 403);
+    assert_eq!(post(None, Some("http://127.0.0.1")).await, 403);
+
+    let config = StreamableHttpClientTransportConfig::with_uri(h.url()).auth_header("s3cret");
+    let lifecycle = ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] };
+    let agent = Agent::default()
+        .serve_with_lifecycle(StreamableHttpClientTransport::from_config(config), lifecycle)
+        .await
+        .expect("an agent with the token connects");
+    let result = call(&agent, "wait_for_answers", json!({ "ticket": "nope" })).await;
+    assert_eq!(result.is_error, Some(true), "and can call tools");
+}
+
+#[tokio::test]
+async fn the_tools_advertise_their_input_and_output_schemas() {
+    let h = start().await;
+    let tools = h.agent().await.list_all_tools().await.expect("tools/list works");
+    let names: Vec<&str> = tools.iter().map(|t| &*t.name).collect();
+    assert_eq!(names, ["ask_user_question", "wait_for_answers"]);
+
+    let ask = &tools[0];
+    let required = |schema: &serde_json::Map<String, Value>| schema["required"].clone();
+    assert_eq!(required(&ask.input_schema), json!(["ticket", "questions"]));
+    let question = &ask.input_schema["$defs"]["Question"];
+    assert_eq!(question["properties"]["multiSelect"]["type"], json!("boolean"));
+    assert_eq!(question["required"], json!(["question", "header"]));
+    for tool in &tools {
+        let output = tool.output_schema.as_ref().expect("structured output is advertised");
+        assert_eq!(output["required"], json!(["status", "ticket"]));
+        assert_eq!(output["$defs"]["Status"]["enum"], json!(["answered", "cancelled", "pending"]));
+    }
+    let description = ask.description.as_deref().unwrap_or_default();
+    for advice in ["ticket", "wait_for_answers", "body", "recommended"] {
+        assert!(description.contains(advice), "the description explains `{advice}`");
+    }
 }

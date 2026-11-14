@@ -17,8 +17,6 @@ pub const MAX_TICKET_LEN: usize = 64;
 pub struct AskInput {
     /// Your own id for this Question Round: short, unique, only `A-Z a-z 0-9 . _ -`,
     /// e.g. `db-choice-7f3`. Reuse it to pick up the answers if this call is dropped.
-    #[serde(default)]
-    #[schemars(required)]
     pub ticket: String,
     /// The Questions of this round, in the order the user should see them.
     pub questions: Vec<Question>,
@@ -83,6 +81,20 @@ pub fn parse<T: serde::de::DeserializeOwned>(arguments: serde_json::Value) -> Re
     })
 }
 
+/// Parses and validates `ask_user_question` arguments. A call written exactly like the
+/// built-in AskUserQuestion lacks `ticket`; the error says how to add one.
+pub fn parse_ask(arguments: serde_json::Value) -> Result<AskInput, String> {
+    if arguments.get("ticket").is_none() {
+        return Err(MISSING_TICKET.into());
+    }
+    let input: AskInput = parse(arguments)?;
+    input.validate()?;
+    Ok(input)
+}
+
+const MISSING_TICKET: &str = "`ticket` is required: choose a short unique id for this round, \
+     e.g. `db-choice-7f3`, and reuse it to pick up the answers if the call is dropped";
+
 impl AskInput {
     /// Checks everything serde cannot; the message tells the Agent what to fix.
     pub fn validate(&self) -> Result<(), String> {
@@ -129,9 +141,7 @@ impl AskInput {
 
 pub fn validate_ticket(ticket: &str) -> Result<(), String> {
     if ticket.is_empty() {
-        return Err("`ticket` is required: choose a short unique id for this round, e.g. \
-                    `db-choice-7f3`, and reuse it to pick up the answers if the call is dropped"
-            .into());
+        return Err(MISSING_TICKET.into());
     }
     if ticket.len() > MAX_TICKET_LEN {
         return Err(format!("`ticket` must be at most {MAX_TICKET_LEN} characters"));
