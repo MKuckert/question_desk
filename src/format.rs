@@ -39,7 +39,14 @@ pub fn structured(result: &RoundResult) -> Output {
             .collect(),
         annotations: questions
             .iter()
-            .filter_map(|q| Some((q.question.clone(), Annotation { notes: q.note.clone()? })))
+            .filter_map(|q| {
+                Some((
+                    q.question.clone(),
+                    Annotation {
+                        notes: q.note.clone()?,
+                    },
+                ))
+            })
             .collect(),
         unanswered: unanswered(result).map(str::to_owned).collect(),
         title: None,
@@ -96,8 +103,12 @@ fn needs_blocks(result: &RoundResult) -> bool {
 /// One `## question` section per Question with its Answer and Note.
 fn blocks(result: &RoundResult) -> String {
     let intro = match result.outcome {
-        Outcome::Submitted => "Your questions have been answered. You can now continue with these answers in mind.",
-        Outcome::Cancelled => "The user cancelled the question round. Answers given before cancelling:",
+        Outcome::Submitted => {
+            "Your questions have been answered. You can now continue with these answers in mind."
+        }
+        Outcome::Cancelled => {
+            "The user cancelled the question round. Answers given before cancelling:"
+        }
     };
     let mut events = paragraph(intro);
     for q in &result.questions {
@@ -178,7 +189,10 @@ fn one_line(result: &RoundResult) -> String {
                 Outcome::Cancelled => "cancelled",
             }
         ),
-        Outcome::Submitted => format!("Your questions have been answered: {}.", answered.join(", ")),
+        Outcome::Submitted => format!(
+            "Your questions have been answered: {}.",
+            answered.join(", ")
+        ),
         Outcome::Cancelled => format!(
             "The user cancelled the question round. Answers given before cancelling: {}.",
             answered.join(", ")

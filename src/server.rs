@@ -18,7 +18,8 @@ use rmcp::{
     handler::server::common::{schema_for_output, schema_for_type},
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities, ServerConfig, Tool,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ServerCapabilities,
+        ServerConfig, Tool,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -29,9 +30,9 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::{
+    desk::Attachment,
     desk::Desk,
     format::{self, RoundResult},
-    desk::Attachment,
     schema::{self, AskInput, Output, WaitInput},
 };
 
@@ -84,7 +85,10 @@ impl Drop for RunningServer {
 /// Binds `127.0.0.1:<port>` and serves the MCP endpoint at `/mcp` on the current runtime.
 pub async fn start(desk: Desk, settings: ServerSettings) -> std::io::Result<RunningServer> {
     let settings = Arc::new(settings);
-    let handler = Handler { desk, settings: settings.clone() };
+    let handler = Handler {
+        desk,
+        settings: settings.clone(),
+    };
     let config = StreamableHttpServerConfig::default().with_legacy_session_mode(false);
     let service: StreamableHttpService<Handler, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(handler.clone()), Default::default(), config);
@@ -103,14 +107,22 @@ pub async fn start(desk: Desk, settings: ServerSettings) -> std::io::Result<Runn
 }
 
 /// Rejects browsers (any `Origin` header, 403) and clients without the bearer token (401).
-async fn guard(State(settings): State<Arc<ServerSettings>>, request: Request, next: Next) -> Response {
+async fn guard(
+    State(settings): State<Arc<ServerSettings>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let headers = request.headers();
     if headers.contains_key(header::ORIGIN) {
         return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
     }
     if let Some(token) = &settings.bearer_token {
         let expected = format!("Bearer {token}");
-        if headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) != Some(&expected) {
+        if headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            != Some(&expected)
+        {
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
@@ -177,8 +189,9 @@ fn finished(result: &RoundResult) -> CallToolResponse {
 
 impl ServerHandler for Handler {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("question-desk", env!("CARGO_PKG_VERSION")))
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("question-desk", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     async fn list_tools(
@@ -211,7 +224,10 @@ impl Handler {
         };
         // Only the per-request `_meta` identifies the client; in stateless mode the peer
         // info is a placeholder (ADR 0001).
-        let client = context.meta.client_info().map(|c| c.title.unwrap_or(c.name));
+        let client = context
+            .meta
+            .client_info()
+            .map(|c| c.title.unwrap_or(c.name));
         let mut attachment = match self.desk.ask(input, client) {
             Ok(attachment) => attachment,
             Err(e) => return tool_error(e),
@@ -222,7 +238,11 @@ impl Handler {
         }
     }
 
-    async fn wait_for_answers(&self, args: Value, context: RequestContext<RoleServer>) -> CallToolResponse {
+    async fn wait_for_answers(
+        &self,
+        args: Value,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResponse {
         let input: WaitInput = match schema::parse(args) {
             Ok(input) => input,
             Err(e) => return tool_error(e),
@@ -233,7 +253,10 @@ impl Handler {
                 input.ticket
             ));
         };
-        match self.wait(&mut attachment, Some(self.settings.pickup_wait), &context).await {
+        match self
+            .wait(&mut attachment, Some(self.settings.pickup_wait), &context)
+            .await
+        {
             Some(result) => finished(&result),
             None => {
                 let (text, output) =
@@ -263,7 +286,8 @@ impl Handler {
         tokio::pin!(deadline);
         let progress_token = context.meta.get_progress_token();
         let interval = self.settings.heartbeat;
-        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        let mut heartbeat =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         let started = Instant::now();
         let mut beats = 0u32;
         let ticket = attachment.ticket().to_owned();

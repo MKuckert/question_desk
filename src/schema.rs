@@ -119,8 +119,13 @@ impl AskInput {
                     "`{at}.multiSelect` is true but the question has no options; add options or drop `multiSelect`"
                 ));
             }
-            if q.recommended.as_deref().is_some_and(|r| r.trim().is_empty()) {
-                return Err(format!("`{at}.recommended` must not be empty; omit it instead"));
+            if q.recommended
+                .as_deref()
+                .is_some_and(|r| r.trim().is_empty())
+            {
+                return Err(format!(
+                    "`{at}.recommended` must not be empty; omit it instead"
+                ));
             }
             let mut labels = HashSet::new();
             for (j, o) in q.options.iter().enumerate() {
@@ -144,7 +149,9 @@ pub fn validate_ticket(ticket: &str) -> Result<(), String> {
         return Err(MISSING_TICKET.into());
     }
     if ticket.len() > MAX_TICKET_LEN {
-        return Err(format!("`ticket` must be at most {MAX_TICKET_LEN} characters"));
+        return Err(format!(
+            "`ticket` must be at most {MAX_TICKET_LEN} characters"
+        ));
     }
     if let Some(c) = ticket
         .chars()

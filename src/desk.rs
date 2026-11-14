@@ -19,6 +19,18 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct Desk {
     state: Arc<Mutex<State>>,
+    listener: Arc<Mutex<Option<Listener>>>,
+}
+
+type Listener = Arc<dyn Fn(DeskEvent) + Send + Sync>;
+
+/// What the UI hears about changes it did not trigger itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskEvent {
+    /// A new Question Round arrived.
+    RoundOpened,
+    /// Anything else changed, e.g. an Agent connected or went away.
+    Changed,
 }
 
 #[derive(Default)]
@@ -135,9 +147,18 @@ pub enum QuestionState {
 pub struct Attachment {
     ticket: String,
     result: watch::Receiver<Option<RoundResult>>,
-    _attached: Arc<()>,
+    /// Counts this call as connected; released on drop.
+    attached: Option<Arc<()>>,
+    desk: Desk,
     title: Option<String>,
     questions: Vec<String>,
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        self.attached.take();
+        self.desk.notify(DeskEvent::Changed);
+    }
 }
 
 impl Attachment {
@@ -170,11 +191,40 @@ impl Desk {
         self.state.lock().expect("desk state is never poisoned")
     }
 
+    /// Registers the one listener (the UI) for changes from the Agent side.
+    pub fn on_change(&self, listener: impl Fn(DeskEvent) + Send + Sync + 'static) {
+        *self
+            .listener
+            .lock()
+            .expect("listener lock is never poisoned") = Some(Arc::new(listener));
+    }
+
+    fn notify(&self, event: DeskEvent) {
+        let listener = self
+            .listener
+            .lock()
+            .expect("listener lock is never poisoned")
+            .clone();
+        if let Some(listener) = listener {
+            listener(event);
+        }
+    }
+
     // ---- Agent side -------------------------------------------------------------------
 
     /// Opens a Question Round for a validated `ask_user_question` call, or reattaches to
     /// the round with the same Ticket if its Questions are identical.
     pub fn ask(&self, input: AskInput, client: Option<String>) -> Result<Attachment, String> {
+        let (attachment, event) = self.open_or_reattach(input, client)?;
+        self.notify(event);
+        Ok(attachment)
+    }
+
+    fn open_or_reattach(
+        &self,
+        input: AskInput,
+        client: Option<String>,
+    ) -> Result<(Attachment, DeskEvent), String> {
         let mut state = self.lock();
         if let Some(round) = state.rounds.iter().find(|r| r.ticket == input.ticket) {
             if round.questions != input.questions {
@@ -183,7 +233,7 @@ impl Desk {
                     input.ticket
                 ));
             }
-            return Ok(round.attach());
+            return Ok((round.attach(self), DeskEvent::Changed));
         }
         let (result, _) = watch::channel(None);
         let session = session_label(client.as_deref(), input.source.as_deref());
@@ -202,12 +252,17 @@ impl Desk {
         if state.selected_round().is_none() {
             state.select_first_open();
         }
-        Ok(state.rounds.last().expect("just pushed").attach())
+        let attachment = state.rounds.last().expect("just pushed").attach(self);
+        Ok((attachment, DeskEvent::RoundOpened))
     }
 
     /// Attaches to the round with this Ticket, open or finished; `None` if unknown.
     pub fn pickup(&self, ticket: &str) -> Option<Attachment> {
-        self.lock().rounds.iter().find(|r| r.ticket == ticket).map(Round::attach)
+        self.lock()
+            .rounds
+            .iter()
+            .find(|r| r.ticket == ticket)
+            .map(|r| r.attach(self))
     }
 
     // ---- User side --------------------------------------------------------------------
@@ -228,7 +283,10 @@ impl Desk {
             };
             match sessions.iter_mut().find(|s| s.label == round.session) {
                 Some(session) => session.rounds.push(summary),
-                None => sessions.push(SessionView { label: round.session.clone(), rounds: vec![summary] }),
+                None => sessions.push(SessionView {
+                    label: round.session.clone(),
+                    rounds: vec![summary],
+                }),
             }
         }
         sessions
@@ -246,8 +304,10 @@ impl Desk {
             .map(|(i, (question, draft))| {
                 let answer = answer(question, draft).answer;
                 let recommended = question.recommended.as_deref();
-                let matches_option =
-                    question.options.iter().any(|o| Some(o.label.as_str()) == recommended);
+                let matches_option = question
+                    .options
+                    .iter()
+                    .any(|o| Some(o.label.as_str()) == recommended);
                 QuestionView {
                     question: question.question.clone(),
                     header: question.header.clone(),
@@ -265,9 +325,7 @@ impl Desk {
                             recommended: Some(o.label.as_str()) == recommended,
                         })
                         .collect(),
-                    recommendation_text: recommended
-                        .filter(|_| !matches_option)
-                        .map(str::to_owned),
+                    recommendation_text: recommended.filter(|_| !matches_option).map(str::to_owned),
                     note: draft.note.clone(),
                     state: if round.step == Step::Question(i) {
                         QuestionState::Current
@@ -292,7 +350,11 @@ impl Desk {
 
     pub fn select(&self, ticket: &str) {
         let mut state = self.lock();
-        if let Some(round) = state.rounds.iter_mut().find(|r| r.ticket == ticket && r.is_open()) {
+        if let Some(round) = state
+            .rounds
+            .iter_mut()
+            .find(|r| r.ticket == ticket && r.is_open())
+        {
             round.seen = true;
             state.selected = Some(ticket.to_owned());
         }
@@ -335,11 +397,17 @@ impl Desk {
     /// then moves on.
     pub fn accept_recommendation(&self) {
         self.with_current_question(|question, draft| {
-            let Some(recommended) = &question.recommended else { return };
+            let Some(recommended) = &question.recommended else {
+                return;
+            };
             if !draft.selected.is_empty() || !draft.note.trim().is_empty() {
                 return;
             }
-            match question.options.iter().position(|o| &o.label == recommended) {
+            match question
+                .options
+                .iter()
+                .position(|o| &o.label == recommended)
+            {
                 Some(index) => draft.selected = vec![index],
                 None => draft.note = recommended.clone(),
             }
@@ -376,6 +444,16 @@ impl Desk {
 
     pub fn cancel(&self) {
         self.finish(Outcome::Cancelled);
+    }
+
+    /// Cancels every open round, e.g. when the user closes the window.
+    pub fn cancel_all(&self) {
+        let mut state = self.lock();
+        for round in state.rounds.iter_mut().filter(|r| r.is_open()) {
+            let result = round.result_for(Outcome::Cancelled);
+            round.result.send_replace(Some(result));
+        }
+        state.selected = None;
     }
 
     /// Delivers the selected round's result and shows the next open round.
@@ -415,12 +493,16 @@ impl State {
 
     fn selected_round(&self) -> Option<&Round> {
         let selected = self.selected.as_ref()?;
-        self.rounds.iter().find(|r| &r.ticket == selected && r.is_open())
+        self.rounds
+            .iter()
+            .find(|r| &r.ticket == selected && r.is_open())
     }
 
     fn selected_round_mut(&mut self) -> Option<&mut Round> {
         let selected = self.selected.as_ref()?;
-        self.rounds.iter_mut().find(|r| &r.ticket == selected && r.is_open())
+        self.rounds
+            .iter_mut()
+            .find(|r| &r.ticket == selected && r.is_open())
     }
 }
 
@@ -437,11 +519,12 @@ impl Round {
             .count()
     }
 
-    fn attach(&self) -> Attachment {
+    fn attach(&self, desk: &Desk) -> Attachment {
         Attachment {
             ticket: self.ticket.clone(),
             result: self.result.subscribe(),
-            _attached: self.attached.clone(),
+            attached: Some(self.attached.clone()),
+            desk: desk.clone(),
             title: self.title.clone(),
             questions: self.questions.iter().map(|q| q.question.clone()).collect(),
         }
@@ -472,11 +555,18 @@ fn answer(question: &Question, draft: &Draft) -> QuestionResult {
     let (answer, note) = if draft.selected.is_empty() {
         (note, None)
     } else {
-        let labels: Vec<&str> =
-            draft.selected.iter().map(|&i| question.options[i].label.as_str()).collect();
+        let labels: Vec<&str> = draft
+            .selected
+            .iter()
+            .map(|&i| question.options[i].label.as_str())
+            .collect();
         (Some(labels.join(", ")), note)
     };
-    QuestionResult { question: question.question.clone(), answer, note }
+    QuestionResult {
+        question: question.question.clone(),
+        answer,
+        note,
+    }
 }
 
 fn session_label(client: Option<&str>, source: Option<&str>) -> String {
