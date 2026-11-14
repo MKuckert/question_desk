@@ -1,0 +1,530 @@
+use crate::theme::Theme;
+use crate::visuals::LabelVisuals;
+use egui::{
+   Align, Color32, FontSelection, Image, Pos2, Rect, Response, RichText, Sense, Stroke, StrokeKind,
+   TextWrapMode, Ui, Vec2, Widget, WidgetText,
+   epaint::{RectShape, TextShape},
+   style::WidgetVisuals,
+   text::LayoutJob,
+};
+use std::sync::Arc;
+
+#[derive(Clone)]
+enum LabelText {
+   Widget(WidgetText),
+   /// One wrapping galley; each [`RichText`] keeps its own style.
+   Sections(Vec<RichText>),
+}
+
+/// Themed text label with an optional trailing (or leading) image.
+///
+/// Interactive by default: hover/click paints a background from
+/// [`LabelVisuals`]. Set [`Label::interactive`] to `false` for static text.
+/// Used as the selected-item face of [`ComboBox`](crate::widgets::ComboBox).
+///
+/// ```
+/// # use egui::__run_test_ui;
+/// # use egui_elements::widgets::Label;
+/// # __run_test_ui(|ui| {
+/// ui.add(Label::new("Hello", None));
+/// # });
+/// ```
+#[must_use = "You should put this widget in a ui with `ui.add(widget);`"]
+#[derive(Clone)]
+pub struct Label {
+   text: LabelText,
+   visuals: Option<LabelVisuals>,
+   pub(crate) image: Option<Image<'static>>,
+   spacing: f32,
+   expansion: Option<f32>,
+   pub(crate) sense: Option<Sense>,
+   wrap_mode: Option<TextWrapMode>,
+   selectable: Option<bool>,
+   text_first: bool,
+   selected: bool,
+   interactive: bool,
+   fill_width: bool,
+   font_size: Option<f32>,
+}
+impl Label {
+   /// Create a new `Label` with text and an optional image.
+   /// By default the image is shown after the text
+   pub fn new(text: impl Into<WidgetText>, image: Option<Image<'static>>) -> Self {
+      Self {
+         text: LabelText::Widget(text.into()),
+         visuals: None,
+         image,
+         spacing: 6.0,
+         expansion: None,
+         sense: None,
+         wrap_mode: None,
+         selectable: None,
+         text_first: true,
+         selected: false,
+         interactive: false,
+         fill_width: false,
+         font_size: None,
+      }
+   }
+
+   /// Mixed-style wrapping paragraph from several [`RichText`] spans.
+   ///
+   /// Unlike [`super::MultiLabel`], the parts share **one** galley, so the
+   /// sentence wraps across style changes. [`RichText::strong`] is a stronger
+   /// color, not a heavier font weight.
+   ///
+   /// Plain strings need [`.into()`](Into::into) when mixed with [`RichText`]:
+   ///
+   /// ```
+   /// # use egui::{RichText, __run_test_ui};
+   /// # use egui_elements::widgets::Label;
+   /// # __run_test_ui(|ui| {
+   /// ui.add(
+   ///    Label::sections(
+   ///       [
+   ///          "Download icons from ".into(),
+   ///          RichText::new("app.com").strong(),
+   ///          " instead of a placeholder.".into(),
+   ///       ],
+   ///       None,
+   ///    )
+   ///    .wrap()
+   ///    .fill_width(true)
+   ///    .interactive(false),
+   /// );
+   /// # });
+   /// ```
+   pub fn sections(
+      parts: impl IntoIterator<Item = impl Into<RichText>>,
+      image: Option<Image<'static>>,
+   ) -> Self {
+      let mut label = Self::new("", image);
+      label.text = LabelText::Sections(parts.into_iter().map(Into::into).collect());
+      label
+   }
+
+   /// Font size for every section.
+   ///
+   /// Overrides per-span sizes from [`RichText::size`].
+   pub fn size(mut self, size: f32) -> Self {
+      self.font_size = Some(size);
+      self
+   }
+
+   /// Set the visuals of the label
+   pub fn visuals(mut self, visuals: LabelVisuals) -> Self {
+      self.visuals = Some(visuals);
+      self
+   }
+
+   /// Set the space between the text and the image.
+   pub fn spacing(mut self, spacing: f32) -> Self {
+      self.spacing = spacing;
+      self
+   }
+
+   /// Expand the bg color on hover
+   pub fn expand(mut self, expansion: Option<f32>) -> Self {
+      self.expansion = expansion;
+      self
+   }
+
+   /// Make the label respond to clicks and/or drags.
+   /// This will also turn the `selectable` to false
+   pub fn sense(mut self, sense: Sense) -> Self {
+      self.sense = Some(sense);
+      self.selectable = Some(false);
+      self
+   }
+
+   /// Make the label interactive
+   ///
+   /// True by default, If false on hover/click there will be no bg color
+   pub fn interactive(mut self, interactive: bool) -> Self {
+      self.interactive = interactive;
+      self
+   }
+
+   /// Set the wrap mode for the text. Defaults to [`Ui::wrap_mode`].
+   pub fn wrap_mode(mut self, wrap_mode: TextWrapMode) -> Self {
+      self.wrap_mode = Some(wrap_mode);
+      self
+   }
+
+   /// Set [`Self::wrap_mode`] to [`TextWrapMode::Wrap`].
+   pub fn wrap(mut self) -> Self {
+      self.wrap_mode = Some(TextWrapMode::Wrap);
+      self
+   }
+
+   /// Set whether the text can be selected with the mouse.
+   pub fn selectable(mut self, selectable: bool) -> Self {
+      self.selectable = Some(selectable);
+      self
+   }
+
+   /// Show the image first and then the text
+   pub fn image_on_left(mut self) -> Self {
+      self.text_first = false;
+      self
+   }
+
+   /// Paint the selected fill from [`LabelVisuals`] even when not hovered.
+   pub fn selected(mut self, selected: bool) -> Self {
+      self.selected = selected;
+      self
+   }
+
+   /// Stretch the label to the available width (useful inside combo popups).
+   pub fn fill_width(mut self, fill: bool) -> Self {
+      self.fill_width = fill;
+      self
+   }
+
+   /// On-screen image size, honoring [`Image::fit_to_exact_size`].
+   ///
+   /// [`Image::size`] is the *texture* size (e.g. 32×32). Using that for wrap
+   /// width makes compact labels wrap even when the image is fitted to 24×24.
+   fn image_display_size(image: &Image<'_>, ui: &Ui) -> Vec2 {
+      image.calc_size(ui.available_size(), image.size())
+   }
+
+   /// Calculate the size needed by the widget.
+   ///
+   /// `available_width` is the width available *for the text part* after accounting for image/spacing.
+   pub fn galley_and_size(
+      &self,
+      ui: &Ui,
+      available_width_for_text: f32,
+   ) -> (Arc<egui::Galley>, Vec2) {
+      let layout_job = self.prepare_layout_job(ui, available_width_for_text);
+      let galley = ui.fonts_mut(|fonts| fonts.layout_job(layout_job));
+      let text_size = galley.size();
+
+      let image_size = self
+         .image
+         .as_ref()
+         .map(|image| Self::image_display_size(image, ui))
+         .unwrap_or(Vec2::ZERO);
+
+      let total_width = text_size.x
+         + if self.image.is_some() {
+            self.spacing + image_size.x
+         } else {
+            0.0
+         };
+
+      let total_height = text_size.y.max(image_size.y);
+      (galley, Vec2::new(total_width, total_height))
+   }
+
+   fn prepare_layout_job(&self, ui: &Ui, wrap_width: f32) -> LayoutJob {
+      let wrap_mode = self.wrap_mode.unwrap_or_else(|| ui.wrap_mode());
+      let mut layout_job = match &self.text {
+         LabelText::Widget(text) => {
+            let layout_job = text.clone().into_layout_job(
+               ui.style(),
+               FontSelection::Default,
+               ui.text_valign(),
+            );
+            (*layout_job).clone()
+         }
+         LabelText::Sections(parts) => {
+            let mut job = LayoutJob::default();
+            for part in parts {
+               part.clone().append_to(
+                  &mut job,
+                  ui.style(),
+                  FontSelection::Default,
+                  ui.text_valign(),
+               );
+            }
+            job
+         }
+      };
+
+      if let Some(size) = self.font_size {
+         for section in &mut layout_job.sections {
+            section.format.font_id.size = size;
+         }
+      }
+
+      match wrap_mode {
+         TextWrapMode::Extend => {
+            layout_job.wrap.max_width = f32::INFINITY;
+         }
+         TextWrapMode::Wrap => {
+            layout_job.wrap.max_width = wrap_width;
+         }
+         TextWrapMode::Truncate => {
+            layout_job.wrap.max_width = wrap_width;
+            layout_job.wrap.max_rows = 1;
+            layout_job.wrap.break_anywhere = true;
+         }
+      }
+
+      layout_job.halign = Align::LEFT;
+      layout_job
+   }
+   pub(crate) fn paint_content_within_rect(
+      &self,
+      ui: &mut Ui,
+      rect: Rect,
+      button_visuals: &WidgetVisuals,
+   ) {
+      // Estimate available width for text layout within the provided rect
+      let available_width_for_text = if let Some(image) = &self.image {
+         (rect.width() - Self::image_display_size(image, ui).x - self.spacing).max(0.0)
+      } else {
+         rect.width()
+      };
+
+      // Calculate galley based on available width
+      let (galley, _) = self.galley_and_size(ui, available_width_for_text);
+      if ui.is_rect_visible(rect) {
+         let (text_pos, image_rect_opt) = layout_content_within_rect(
+            ui,
+            rect,
+            &galley,
+            &self.image,
+            self.spacing,
+            self.text_first,
+         );
+
+         let text_color = self
+            .visuals
+            .or_else(|| Theme::label_visuals_from_ctx(ui.ctx()))
+            .as_ref()
+            .map(|v| v.text)
+            .unwrap_or(button_visuals.text_color());
+         ui.painter().add(TextShape::new(
+            text_pos,
+            galley.clone(),
+            text_color,
+         ));
+
+         if let Some(image_rect) = image_rect_opt {
+            if let Some(image) = &self.image {
+               image.paint_at(ui, image_rect);
+            }
+         }
+      }
+   }
+}
+
+fn layout_content_within_rect(
+   ui: &Ui,
+   rect: Rect,
+   galley: &egui::Galley,
+   image: &Option<Image<'static>>,
+   spacing: f32,
+   text_first: bool,
+) -> (Pos2, Option<Rect>) {
+   let text_size = galley.size();
+   let image_size = image
+      .as_ref()
+      .map(|image| Label::image_display_size(image, ui))
+      .unwrap_or(Vec2::ZERO);
+
+   let total_content_height = text_size.y.max(image_size.y);
+   let top_y = ui
+      .layout()
+      .align_size_within_rect(Vec2::new(0.0, total_content_height), rect)
+      .min
+      .y;
+
+   let (text_start_x, image_final_rect) = if text_first {
+      // Text first, image second
+      let text_start_x = rect.left();
+      let image_start_x = text_start_x + text_size.x + spacing;
+      let image_final_rect = image.as_ref().map(|_| {
+         let image_pos = Pos2::new(
+            image_start_x,
+            top_y + (total_content_height - image_size.y) * 0.5,
+         );
+         Rect::from_min_size(image_pos, image_size)
+      });
+      (text_start_x, image_final_rect)
+   } else {
+      // Image first, text second
+      let image_start_x = rect.left();
+      let text_start_x = image_start_x + image_size.x + spacing;
+      let image_final_rect = image.as_ref().map(|_| {
+         let image_pos = Pos2::new(
+            image_start_x,
+            top_y + (total_content_height - image_size.y) * 0.5,
+         );
+         Rect::from_min_size(image_pos, image_size)
+      });
+      (text_start_x, image_final_rect)
+   };
+
+   let text_pos = Pos2::new(
+      text_start_x,
+      top_y + (total_content_height - text_size.y) * 0.5,
+   );
+   (text_pos, image_final_rect)
+}
+
+impl Widget for Label {
+   fn ui(self, ui: &mut Ui) -> Response {
+      // Calculate Size (Content Only)
+      let image_size = self
+         .image
+         .as_ref()
+         .map(|image| Self::image_display_size(image, ui))
+         .unwrap_or(Vec2::ZERO);
+
+      let effective_wrap_mode = self.wrap_mode.unwrap_or_else(|| ui.wrap_mode());
+
+      let available_width_for_text = match effective_wrap_mode {
+         TextWrapMode::Extend => f32::INFINITY,
+         _ => {
+            // Wrap or Truncate
+            if self.image.is_some() {
+               (ui.available_width() - self.spacing - image_size.x).max(10.0)
+            } else {
+               ui.available_width()
+            }
+         }
+      };
+
+      let (galley, content_size) = self.galley_and_size(ui, available_width_for_text);
+      let desired_size = if self.fill_width {
+         Vec2::new(ui.available_width(), content_size.y)
+      } else {
+         content_size
+      };
+
+      // Allocate Space (Content Size Only)
+      let sense = self.sense.unwrap_or(if self.interactive {
+         Sense::hover()
+      } else {
+         Sense::empty()
+      });
+      let (rect, response) = ui.allocate_exact_size(desired_size, sense);
+
+      // Paint
+      if ui.is_rect_visible(rect) {
+         let visuals = ui.style().interact_selectable(&response, self.selected);
+         let label_visuals = self.visuals.or_else(|| Theme::label_visuals_from_ctx(ui.ctx()));
+
+         let fill = if self.selected {
+            label_visuals.as_ref().map(|v| v.bg_selected).unwrap_or(visuals.bg_fill)
+         } else if response.hovered() || response.has_focus() {
+            match self.interactive {
+               true => label_visuals.as_ref().map(|v| v.bg_hover).unwrap_or(visuals.weak_bg_fill),
+               false => Color32::TRANSPARENT,
+            }
+         } else {
+            label_visuals.as_ref().map(|v| v.bg).unwrap_or(Color32::TRANSPARENT)
+         };
+
+         let stroke = if self.selected {
+            label_visuals.as_ref().map(|v| v.border_hover).unwrap_or(visuals.bg_stroke)
+         } else if response.hovered() || response.has_focus() {
+            match self.interactive {
+               true => label_visuals.as_ref().map(|v| v.border_hover).unwrap_or(visuals.bg_stroke),
+               false => Stroke::new(0.0, Color32::TRANSPARENT),
+            }
+         } else {
+            label_visuals.as_ref().map(|v| v.border).unwrap_or(Stroke::NONE)
+         };
+
+         let expansion = self.expansion.unwrap_or(visuals.expansion);
+         let corner =
+            label_visuals.as_ref().map(|v| v.corner_radius).unwrap_or(visuals.corner_radius);
+         let background_rect = rect.expand(expansion);
+
+         ui.painter().add(RectShape::new(
+            background_rect,
+            corner,
+            fill,
+            stroke,
+            StrokeKind::Inside,
+         ));
+
+         // Layout and Paint Content
+         let (text_pos, image_rect_opt) = layout_content_within_rect(
+            ui,
+            rect,
+            &galley,
+            &self.image,
+            self.spacing,
+            self.text_first,
+         );
+
+         let text_color = label_visuals.as_ref().map(|v| v.text).unwrap_or(visuals.text_color());
+
+         ui.painter().add(TextShape::new(
+            text_pos,
+            galley.clone(),
+            text_color,
+         ));
+
+         if let Some(image_rect) = image_rect_opt {
+            if let Some(image) = self.image {
+               image.paint_at(ui, image_rect);
+            }
+         }
+      }
+      response
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn sections_keep_distinct_formats_and_wrap() {
+      egui::__run_test_ui(|ui| {
+         let label = Label::sections(
+            [
+               "Download icons from ".into(),
+               RichText::new("app.com").strong(),
+               " so unknown tokens show an image instead of a placeholder.".into(),
+            ],
+            None,
+         )
+         .size(18.0)
+         .wrap();
+
+         let job = label.prepare_layout_job(ui, 180.0);
+         assert!(
+            job.sections.len() >= 2,
+            "expected mixed styles, got {} section(s)",
+            job.sections.len()
+         );
+         assert!(job.text.contains("app.com"));
+         assert!(
+            job.sections.iter().all(|s| s.format.font_id.size == 18.0),
+            "Label::size should apply to every section"
+         );
+         let strong_color = ui.style().visuals.strong_text_color();
+         assert!(
+            job.sections.iter().any(|s| s.format.color == strong_color),
+            "strong span should keep the strong text color"
+         );
+         assert_eq!(job.wrap.max_width, 180.0);
+      });
+   }
+
+   #[test]
+   fn italics_and_underline_survive() {
+      egui::__run_test_ui(|ui| {
+         let label = Label::sections(
+            [
+               RichText::new("plain "),
+               RichText::new("italics").italics(),
+               RichText::new(" ").underline(),
+               RichText::new("underlined").underline(),
+            ],
+            None,
+         );
+         let job = label.prepare_layout_job(ui, 400.0);
+         assert!(job.sections.iter().any(|s| s.format.italics));
+         assert!(job.sections.iter().any(|s| s.format.underline != Stroke::NONE));
+      });
+   }
+}

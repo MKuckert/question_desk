@@ -1,8 +1,11 @@
 //! The Question Desk window: renders the `desk` read model and dispatches user intents.
 
+mod appearance;
 mod grapheme;
 #[cfg(target_os = "macos")]
 mod macos_text_input;
+#[cfg(test)]
+mod screenshots;
 
 use std::{
     sync::{
@@ -13,10 +16,16 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, ScrollArea, Sense, Stroke,
-    TextEdit, TextStyle,
+    self, Color32, CornerRadius, FontId, Image, Key, KeyboardShortcut, Modifiers, RichText,
+    ScrollArea, Sense, Shadow, Stroke, TextEdit,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_elements::{
+    Badge, Button, HoldBurst, Label, Modal, egui_lucide::Lucide, theme::ThemeColors,
+    visuals::FrameVisuals,
+};
+
+use appearance::Appearance;
 
 use crate::desk::{
     Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundView, SessionView, Step,
@@ -24,6 +33,7 @@ use crate::desk::{
 use grapheme::GraphemeText;
 
 const ZOOM_KEY: &str = "zoom_factor";
+const THEME_KEY: &str = "theme";
 /// Below this width of the page the preview panel moves under the Options.
 const WIDE_LAYOUT: f32 = 720.0;
 
@@ -49,51 +59,15 @@ pub fn run(desk: Desk, status: String) -> eframe::Result {
                 .and_then(|z| z.parse::<f32>().ok())
                 .unwrap_or(1.0);
             cc.egui_ctx.set_zoom_factor(zoom);
-            set_text_sizes(&cc.egui_ctx);
-
-            let attention = Arc::new(AtomicBool::new(false));
-            let ctx = cc.egui_ctx.clone();
-            let flag = attention.clone();
-            desk.on_change(move |event| {
-                if event == DeskEvent::RoundOpened {
-                    flag.store(true, Ordering::Relaxed);
-                }
-                ctx.request_repaint();
-            });
-            Ok(Box::new(App {
+            let theme = cc.storage.and_then(|s| s.get_string(THEME_KEY));
+            Ok(Box::new(App::new(
+                &cc.egui_ctx,
                 desk,
                 status,
-                attention,
-                restore_window_level: false,
-                sidebar_open: true,
-                dialog: None,
-                closing: false,
-                hovered_option: None,
-                note_focus: None,
-                markdown: CommonMarkCache::default(),
-                zoom: None,
-            }))
+                theme.as_deref(),
+            )))
         }),
     )
-}
-
-/// A larger base font than egui's default; long text should be comfortable to read.
-fn set_text_sizes(ctx: &egui::Context) {
-    ctx.global_style_mut(|style| {
-        for (text_style, size) in [
-            (TextStyle::Small, 12.0),
-            (TextStyle::Body, 16.0),
-            (TextStyle::Button, 16.0),
-            (TextStyle::Monospace, 14.0),
-            (TextStyle::Heading, 24.0),
-        ] {
-            if let Some(font) = style.text_styles.get_mut(&text_style) {
-                font.size = size;
-            }
-        }
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    });
 }
 
 /// The Option card under the mouse: Ticket, Question index, Option index.
@@ -135,6 +109,7 @@ struct App {
     markdown: CommonMarkCache,
     /// Last seen zoom factor (`Cmd +/-`), saved with the window size.
     zoom: Option<f32>,
+    appearance: Appearance,
 }
 
 impl eframe::App for App {
@@ -153,6 +128,7 @@ impl eframe::App for App {
         if let Some(zoom) = self.zoom {
             storage.set_string(ZOOM_KEY, zoom.to_string());
         }
+        storage.set_string(THEME_KEY, self.appearance.theme.kind.to_str().to_owned());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -161,6 +137,35 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// `theme` is the stored [`egui_elements::ThemeKind`] name; Tokyo Night if absent.
+    fn new(ctx: &egui::Context, desk: Desk, status: String, theme: Option<&str>) -> Self {
+        egui_extras::install_image_loaders(ctx);
+        let appearance = Appearance::new(ctx, theme);
+        let attention = Arc::new(AtomicBool::new(false));
+        let repaint = ctx.clone();
+        let flag = attention.clone();
+        desk.on_change(move |event| {
+            if event == DeskEvent::RoundOpened {
+                flag.store(true, Ordering::Relaxed);
+            }
+            repaint.request_repaint();
+        });
+        Self {
+            desk,
+            status,
+            attention,
+            restore_window_level: false,
+            sidebar_open: true,
+            dialog: None,
+            closing: false,
+            hovered_option: None,
+            note_focus: None,
+            markdown: CommonMarkCache::default(),
+            zoom: None,
+            appearance,
+        }
+    }
+
     fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.zoom = Some(ctx.zoom_factor());
@@ -170,7 +175,7 @@ impl App {
         let sessions = self.desk.sessions();
         let round = self.desk.current();
 
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, round.as_ref()));
+        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &sessions, round.as_ref()));
         if let Some(round) = &round {
             egui::Panel::bottom("footer").show(ui, |ui| self.footer(ui, round));
         }
@@ -194,6 +199,7 @@ impl App {
             self.shortcuts(&ctx, round);
         }
         self.dialogs(&ctx, round.as_ref());
+        self.appearance.show(ui);
     }
 
     /// On a new round: bring the window to the front and ask for attention (dock bounce,
@@ -230,47 +236,85 @@ impl App {
 
     // ---- Chrome ---------------------------------------------------------------------------
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, round: Option<&RoundView>) {
+    fn top_bar(&mut self, ui: &mut egui::Ui, sessions: &[SessionView], round: Option<&RoundView>) {
+        let colors = self.appearance.colors();
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            let toggle = if self.sidebar_open { "⏴" } else { "☰" };
-            if ui
-                .button(toggle)
-                .on_hover_text("Show or hide open rounds")
-                .clicked()
-            {
+            let (icon, hint) = if self.sidebar_open {
+                (Lucide::PanelLeftClose, "Hide open rounds")
+            } else {
+                (Lucide::PanelLeftOpen, "Show open rounds")
+            };
+            let mut toggle = Button::new(icon_image(icon, colors.text));
+            let unseen = sessions
+                .iter()
+                .flat_map(|s| &s.rounds)
+                .filter(|r| r.new)
+                .count();
+            if unseen > 0 {
+                toggle = toggle.badge(Badge::new(unseen.to_string()));
+            }
+            if ui.add(toggle).on_hover_text(hint).clicked() {
                 self.sidebar_open = !self.sidebar_open;
             }
-            let Some(round) = round else {
-                ui.label(RichText::new("Question Desk").strong());
-                return;
-            };
-            ui.label(RichText::new(&round.session).weak());
-            if let Some(title) = &round.title {
-                ui.label(RichText::new(title).strong());
+            match round {
+                None => {
+                    ui.label(RichText::new("Question Desk").strong());
+                }
+                Some(round) => {
+                    ui.label(RichText::new(&round.session).color(colors.text_muted));
+                    if let Some(title) = &round.title {
+                        ui.label(RichText::new(title).strong());
+                    }
+                    if !round.connected {
+                        ui.add(Label::new(
+                            RichText::new("Agent disconnected").color(colors.warning),
+                            Some(icon_image(Lucide::TriangleAlert, colors.warning)),
+                        ))
+                        .on_hover_text(
+                            "No Agent call is waiting for this round. Your answers are kept; \
+                             the Agent can pick them up with its ticket.",
+                        );
+                    }
+                }
             }
-            if !round.connected {
-                ui.label(RichText::new("⚠ Agent disconnected").color(warn_color(ui)))
-                    .on_hover_text(
-                        "No Agent call is waiting for this round. Your answers are kept; \
-                         the Agent can pick them up with its ticket.",
-                    );
-            }
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match round.step {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(Button::new(icon_image(Lucide::Settings, colors.text)))
+                    .on_hover_text("Appearance")
+                    .clicked()
+                {
+                    self.appearance.window_open = !self.appearance.window_open;
+                }
+                let (icon, hint) = if self.appearance.theme.dark {
+                    (Lucide::Sun, "Switch to light mode")
+                } else {
+                    (Lucide::Moon, "Switch to dark mode")
+                };
+                if ui
+                    .add(Button::new(icon_image(icon, colors.text)))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    self.appearance.toggle_dark(ui.ctx());
+                }
+                let Some(round) = round else { return };
+                ui.add_space(8.0);
+                match round.step {
                     Step::Question(i) => {
                         ui.label(
                             RichText::new(format!("{} / {}", i + 1, round.questions.len()))
                                 .strong(),
                         );
-                        chip(ui, &round.questions[i].header);
+                        chip(ui, &round.questions[i].header, colors.accent);
                     }
                     Step::Review => {
                         ui.label(RichText::new("Review").strong());
                     }
-                },
-            );
+                }
+            });
         });
+        ui.add_space(2.0);
     }
 
     fn sidebar(
@@ -279,16 +323,22 @@ impl App {
         sessions: &[SessionView],
         current: Option<&RoundView>,
     ) {
-        ui.add_space(4.0);
+        let colors = self.appearance.colors();
+        ui.add_space(8.0);
         ui.label(RichText::new("Open rounds").strong());
         ui.separator();
         ScrollArea::vertical().show(ui, |ui| {
             if sessions.is_empty() {
-                ui.label(RichText::new("None").weak());
+                ui.label(RichText::new("None").color(colors.text_muted));
             }
             for session in sessions {
                 ui.add_space(6.0);
-                ui.label(RichText::new(&session.label).small().strong());
+                ui.label(
+                    RichText::new(&session.label)
+                        .small()
+                        .strong()
+                        .color(colors.text_muted),
+                );
                 for round in &session.rounds {
                     let selected = current.is_some_and(|c| c.ticket == round.ticket);
                     let name = round.title.as_deref().unwrap_or(&round.ticket);
@@ -298,13 +348,17 @@ impl App {
                         round.total,
                         age(round.opened_at)
                     );
-                    if round.new {
-                        text = format!("● {text}");
-                    }
                     if !round.connected {
                         text.push_str(" · ⚠ disconnected");
                     }
-                    if ui.selectable_label(selected, text).clicked() {
+                    let mut button = Button::selectable(selected, text)
+                        .wrap()
+                        .min_size(egui::vec2(ui.available_width(), 0.0));
+                    if round.new {
+                        button =
+                            button.badge(Badge::dot().min_diameter(9.0).padding(0.0).inset(8.0));
+                    }
+                    if ui.add(button).clicked() {
                         self.desk.select(&round.ticket);
                     }
                 }
@@ -313,38 +367,60 @@ impl App {
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
+        let colors = self.appearance.colors();
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() / 3.0);
+            ui.add(Image::new(
+                Lucide::Inbox
+                    .size(48.0)
+                    .stroke_width(1.5)
+                    .color(colors.accent)
+                    .source(),
+            ));
+            ui.add_space(8.0);
             ui.heading("No open questions");
             ui.add_space(8.0);
-            ui.label(RichText::new(&self.status).weak());
+            ui.label(RichText::new(&self.status).color(colors.text_muted));
         });
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, round: &RoundView) {
-        ui.add_space(4.0);
+        let colors = self.appearance.colors();
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("Cancel round").clicked() {
+            let cancel = Button::new((
+                icon_image(Lucide::X, colors.error),
+                RichText::new("Cancel round").color(colors.error),
+            ));
+            if ui.add(cancel).clicked() {
                 self.dialog = Some(Dialog::Cancel);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match round.step {
                     Step::Question(_) => {
-                        if ui.button(RichText::new("Next ⏵").strong()).clicked() {
+                        let next = Button::new((
+                            RichText::new("Next").strong().color(colors.bg),
+                            icon_image(Lucide::ChevronRight, colors.bg),
+                        ))
+                        .bg_color(colors.accent);
+                        if ui.add(next).clicked() {
                             self.desk.next();
                         }
                     }
                     Step::Review => {
-                        if ui.button(RichText::new("Submit").strong()).clicked() {
+                        let submit = Button::new((
+                            icon_image(Lucide::Send, colors.bg),
+                            RichText::new("Submit").strong().color(colors.bg),
+                        ))
+                        .bg_color(colors.success);
+                        if ui.add(submit).clicked() {
                             self.submit(round);
                         }
                     }
                 }
                 let at_start = round.step == Step::Question(0);
-                if ui
-                    .add_enabled(!at_start, egui::Button::new("⏴ Back"))
-                    .clicked()
-                {
+                let back = Button::new((icon_image(Lucide::ChevronLeft, colors.text), "Back"));
+                if ui.add_enabled(!at_start, back).clicked() {
                     self.desk.back();
                 }
             });
@@ -358,47 +434,41 @@ impl App {
         ui.label(
             RichText::new(hint.replace('⌘', cmd_symbol()))
                 .small()
-                .weak(),
+                .color(colors.text_muted),
         );
-        ui.add_space(2.0);
+        ui.add_space(4.0);
     }
 
     fn step_bar(&mut self, ui: &mut egui::Ui, round: &RoundView) {
+        let colors = self.appearance.colors();
+        let size = egui::vec2(34.0, 28.0);
         ui.horizontal_wrapped(|ui| {
             for (i, question) in round.questions.iter().enumerate() {
-                let (fill, text) = match question.state {
-                    QuestionState::Current => (
-                        ui.visuals().selection.bg_fill,
-                        ui.visuals().strong_text_color(),
-                    ),
-                    QuestionState::Answered => {
-                        (answered_color(ui), ui.visuals().strong_text_color())
-                    }
-                    QuestionState::Unanswered => {
-                        (Color32::TRANSPARENT, ui.visuals().weak_text_color())
-                    }
+                let number = RichText::new((i + 1).to_string());
+                let button = match question.state {
+                    QuestionState::Current => Button::new(number.strong()).selected(true),
+                    QuestionState::Answered => Button::new(number.color(colors.bg))
+                        .bg_color(colors.success.gamma_multiply(0.85)),
+                    QuestionState::Unanswered => Button::new(number.color(colors.text_muted)),
                 };
-                let button = egui::Button::new(RichText::new((i + 1).to_string()).color(text))
-                    .fill(fill)
-                    .min_size(egui::vec2(32.0, 26.0));
-                if ui.add(button).on_hover_text(&question.question).clicked() {
+                if ui
+                    .add(button.min_size(size).label_align(egui::Align::Center))
+                    .on_hover_text(&question.question)
+                    .clicked()
+                {
                     self.desk.go_to(i);
                 }
             }
-            let review = round.step == Step::Review;
-            let fill = if review {
-                ui.visuals().selection.bg_fill
-            } else {
-                Color32::TRANSPARENT
-            };
-            if ui
-                .add(
-                    egui::Button::new("Review")
-                        .fill(fill)
-                        .min_size(egui::vec2(32.0, 26.0)),
-                )
-                .clicked()
-            {
+            // The Review step carries the number of Unanswered Questions as a badge.
+            let unanswered = round.unanswered().len();
+            // Room on the right for the badge, which is painted over the corner.
+            let mut review = Button::new("Review")
+                .selected(round.step == Step::Review)
+                .min_size(egui::vec2(104.0, size.y));
+            if unanswered > 0 {
+                review = review.badge(Badge::new(unanswered.to_string()).min_diameter(14.0));
+            }
+            if ui.add(review).clicked() {
                 self.desk.review();
             }
         });
@@ -429,7 +499,7 @@ impl App {
                 }
                 if let Some(recommendation) = &question.recommendation_text {
                     ui.horizontal_wrapped(|ui| {
-                        chip(ui, "Recommended");
+                        chip(ui, "Recommended", self.appearance.colors().success);
                         ui.label(recommendation);
                     });
                     ui.add_space(4.0);
@@ -448,7 +518,10 @@ impl App {
         index: usize,
     ) {
         if question.options.is_empty() {
-            ui.label(RichText::new("Open question: answer in the note below.").weak());
+            ui.label(
+                RichText::new("Open question: answer in the note below.")
+                    .color(self.appearance.colors().text_muted),
+            );
             return;
         }
         let preview = self.preview(round, question, index);
@@ -496,7 +569,13 @@ impl App {
     ) {
         let mut hovered = None;
         for (i, option) in question.options.iter().enumerate() {
-            let response = option_card(ui, option, i, question.multi_select);
+            let response = option_card(
+                ui,
+                &self.appearance.colors(),
+                option,
+                i,
+                question.multi_select,
+            );
             if response.hovered() {
                 hovered = Some(i);
             }
@@ -546,13 +625,14 @@ impl App {
     // ---- Review page ----------------------------------------------------------------------
 
     fn review_page(&mut self, ui: &mut egui::Ui, round: &RoundView) {
+        let colors = self.appearance.colors();
         self.step_bar(ui, round);
         ui.add_space(8.0);
         ui.heading("Review your answers");
         let unanswered = round.unanswered().len();
         if unanswered > 0 {
             ui.label(
-                RichText::new(format!("{unanswered} question(s) unanswered")).color(warn_color(ui)),
+                RichText::new(format!("{unanswered} question(s) unanswered")).color(colors.warning),
             );
         }
         ui.add_space(6.0);
@@ -560,16 +640,19 @@ impl App {
             .id_salt(("review", &round.ticket))
             .show(ui, |ui| {
                 for (i, question) in round.questions.iter().enumerate() {
-                    let response = egui::Frame::group(ui.style())
-                        .stroke(match question.answer {
-                            None => Stroke::new(1.5, warn_color(ui)),
-                            Some(_) => ui.visuals().widgets.noninteractive.bg_stroke,
-                        })
+                    let warn = question.answer.is_none().then_some(colors.warning);
+                    let response = egui_elements::Frame::new()
+                        .visuals(card_visuals(&colors, warn))
+                        .inner_margin(12)
+                        .interactive(true)
+                        .sense(Sense::click())
+                        .fill_width(true)
                         .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(format!("{}.", i + 1)).weak());
-                                chip(ui, &question.header);
+                                ui.label(
+                                    RichText::new(format!("{}.", i + 1)).color(colors.text_muted),
+                                );
+                                chip(ui, &question.header, colors.accent);
                                 ui.label(RichText::new(&question.question).strong());
                             });
                             match &question.answer {
@@ -578,16 +661,17 @@ impl App {
                                 }
                                 None => {
                                     ui.label(
-                                        RichText::new("Unanswered").italics().color(warn_color(ui)),
+                                        RichText::new("Unanswered").italics().color(colors.warning),
                                     );
                                 }
                             }
                             if let Some(note) = &question.answer_note {
-                                ui.label(RichText::new(format!("Note: {note}")).weak());
+                                ui.label(
+                                    RichText::new(format!("Note: {note}")).color(colors.text_muted),
+                                );
                             }
                         })
                         .response
-                        .interact(Sense::click())
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("Edit this answer");
                     if response.clicked() {
@@ -726,26 +810,47 @@ impl App {
                 "Cancel rounds and quit",
             ),
         };
+        let colors = self.appearance.colors();
+        // Cancelling throws away the Agent's wait: hold to confirm. Submitting is harmless.
+        let destructive = dialog != Dialog::SubmitUnanswered;
         let mut decision = None;
-        let modal = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            ui.heading(title);
-            ui.label(text);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(confirm).strong()).clicked() {
-                    decision = Some(true);
-                }
-                if ui.button("Keep answering").clicked() {
-                    decision = Some(false);
-                }
+        let mut open = true;
+        let entered = Modal::new("dialog", &mut open)
+            .heading(title)
+            .max_width(440.0)
+            .alert(destructive)
+            .footer(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let confirm = if destructive {
+                        Button::new(
+                            RichText::new(format!("Hold to {}", confirm.to_lowercase()))
+                                .strong()
+                                .color(colors.error),
+                        )
+                        .hold(1.0)
+                        .hold_fill(colors.error.gamma_multiply(0.45))
+                        .hold_burst(HoldBurst::Glow)
+                    } else {
+                        Button::new(RichText::new(confirm).strong().color(colors.bg))
+                            .bg_color(colors.accent)
+                    };
+                    if ui.add(confirm).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.add(Button::new("Keep answering")).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            })
+            .show(ctx, |ui| {
+                ui.label(text);
+                // Enter confirms only the harmless dialog; cancelling needs a hold.
+                !destructive && ui.input(|i| i.key_pressed(Key::Enter))
             });
-            // Enter confirms only the harmless dialog; cancelling needs a click.
-            if dialog == Dialog::SubmitUnanswered && ui.input(|i| i.key_pressed(Key::Enter)) {
-                decision = Some(true);
-            }
-        });
-        if modal.should_close() && decision.is_none() {
+        if entered == Some(true) {
+            decision = Some(true);
+        }
+        if !open && decision.is_none() {
             decision = Some(false);
         }
         match decision {
@@ -767,46 +872,67 @@ impl App {
     }
 }
 
+/// Card chrome for Option cards and Review entries: `accent` marks the card (selected or
+/// unanswered) with a thicker border in that color.
+fn card_visuals(colors: &ThemeColors, accent: Option<Color32>) -> FrameVisuals {
+    let border = match accent {
+        Some(color) => Stroke::new(2.0, color),
+        None => Stroke::new(1.0, colors.border),
+    };
+    FrameVisuals {
+        bg: colors.widget_bg,
+        bg_hover: colors.hover,
+        bg_click: colors.highlight,
+        bg_selected: colors.highlight,
+        border,
+        border_hover: Stroke::new(border.width, accent.unwrap_or(colors.accent)),
+        border_click: Stroke::new(border.width, colors.accent),
+        corner_radius: CornerRadius::same(10),
+        shadow: Shadow::NONE,
+    }
+}
+
 fn option_card(
     ui: &mut egui::Ui,
+    colors: &ThemeColors,
     option: &OptionView,
     index: usize,
     multi_select: bool,
 ) -> egui::Response {
-    let visuals = ui.visuals().clone();
-    let stroke = if option.selected {
-        Stroke::new(2.0, visuals.selection.stroke.color)
-    } else {
-        visuals.widgets.inactive.bg_stroke
-    };
-    let fill = if option.selected {
-        visuals.selection.bg_fill.gamma_multiply(0.35)
-    } else {
-        visuals.faint_bg_color
-    };
-    let inner = egui::Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(8.0)
-        .inner_margin(12.0)
+    let accent = option.selected.then_some(colors.accent);
+    egui_elements::Frame::new()
+        .visuals(card_visuals(colors, accent))
+        .inner_margin(12)
+        .interactive(true)
+        .selected(option.selected)
+        .sense(Sense::click())
+        .fill_width(true)
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let mark = match (multi_select, option.selected) {
-                    (true, true) => "☑",
-                    (true, false) => "☐",
-                    (false, true) => "◉",
-                    (false, false) => "○",
+                    (true, true) => Lucide::SquareCheck,
+                    (true, false) => Lucide::Square,
+                    (false, true) => Lucide::CircleDot,
+                    (false, false) => Lucide::Circle,
                 };
-                ui.label(RichText::new(mark).size(20.0));
+                let color = if option.selected {
+                    colors.accent
+                } else {
+                    colors.text_muted
+                };
+                ui.add(Image::new(mark.size(20.0).color(color).source()));
                 ui.vertical(|ui| {
                     ui.horizontal_wrapped(|ui| {
                         if index < 9 {
-                            ui.label(RichText::new((index + 1).to_string()).weak().monospace());
+                            ui.label(
+                                RichText::new((index + 1).to_string())
+                                    .monospace()
+                                    .color(colors.text_muted),
+                            );
                         }
                         ui.label(RichText::new(&option.label).strong());
                         if option.recommended {
-                            chip(ui, "Recommended");
+                            chip(ui, "Recommended", colors.success);
                         }
                     });
                     if !option.description.is_empty() {
@@ -814,10 +940,8 @@ fn option_card(
                     }
                 });
             });
-        });
-    inner
+        })
         .response
-        .interact(Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -830,41 +954,36 @@ fn preview_panel(ui: &mut egui::Ui, preview: Option<&str>) {
             ScrollArea::both()
                 .id_salt("preview")
                 .max_height(420.0)
-                .show(ui, |ui| {
-                    match preview {
-                        Some(preview) => {
-                            ui.label(RichText::new(preview).font(FontId::monospace(14.0)));
-                        }
-                        None => {
-                            ui.label(RichText::new("Hover an option to see its preview.").weak());
-                        }
+                .show(ui, |ui| match preview {
+                    Some(preview) => {
+                        ui.label(RichText::new(preview).font(FontId::monospace(14.0)));
+                    }
+                    None => {
+                        ui.label(RichText::new("Hover an option to see its preview.").weak());
                     }
                 });
         });
 }
 
-fn chip(ui: &mut egui::Ui, text: &str) {
+/// A small pill tinted with `color`.
+fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
-        .fill(ui.visuals().widgets.inactive.bg_fill)
+        .fill(color.gamma_multiply(0.18))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| ui.label(RichText::new(text).small().strong()));
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).small().strong().color(color))
+        });
+}
+
+/// A Lucide icon sized for buttons and labels.
+fn icon_image(icon: Lucide, color: Color32) -> Image<'static> {
+    Image::new(icon.size(18.0).color(color).source()).fit_to_exact_size(egui::vec2(18.0, 18.0))
 }
 
 fn note_id(ticket: &str, index: usize) -> egui::Id {
     egui::Id::unique(("note", ticket, index))
-}
-
-fn warn_color(ui: &egui::Ui) -> Color32 {
-    ui.visuals().warn_fg_color
-}
-
-fn answered_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(40, 90, 55)
-    } else {
-        Color32::from_rgb(190, 230, 200)
-    }
 }
 
 fn cmd_symbol() -> &'static str {

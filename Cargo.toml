@@ -8,7 +8,9 @@ default-run = "question-desk"
 axum = "0.8"
 directories = "6.0.0"
 eframe = { version = "0.37", features = ["persistence"] }
+egui-elements = { version = "1.4", features = ["full"] }
 egui_commonmark = "0.26"
+egui_extras = { version = "0.37", features = ["svg"] }
 env_logger = "0.11.11"
 futures-util = "0.3.34"
 log = "0.4.35"
@@ -25,6 +27,8 @@ tracing = "0.1.44"
 unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+egui_system_font_provider = "0.37"
 insta = "1.49.0"
 reqwest = "0.13.5"
 
@@ -32,3 +36,8 @@ reqwest = "0.13.5"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAttributedString", "NSRange", "NSString"] }
+
+# egui-elements 1.4.0 does not build when egui's `persistence` feature is on (eframe
+# "persistence" turns it on): SecureTextEditState lacks serde derives. Patched copy.
+[patch.crates-io]
+egui-elements = { path = "vendor/egui-elements" }
