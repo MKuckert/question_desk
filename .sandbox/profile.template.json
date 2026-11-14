@@ -4,13 +4,13 @@
   "groups": { "include": ["rust_runtime"] },
   "meta": {
     "name": "ask_user_question_ui",
-    "version": "4"
+    "version": "7"
   },
   "workdir": {
     "access": "readwrite"
   },
   "filesystem": {
-    "allow": ["~/.cargo/"],
+    "allow": ["~/.cargo/", "~/Library/Application Support/question-desk"],
     "deny": ["~/.gitconfig"],
     "read_file": [
       "~/.gitconfig-private",
@@ -27,6 +27,11 @@
     "allow_domain": []
   },
   "allow_gpu": true,
+  "unsafe_macos_seatbelt_rules": [
+    "(allow iokit-open (iokit-user-client-class \"RootDomainUserClient\") (iokit-user-client-class \"IOSurfaceRootUserClient\"))",
+    "(allow iokit-get-properties)",
+    "(allow mach-register)"
+  ],
   "environment": {
     "allow_vars": [
       "HOME",
