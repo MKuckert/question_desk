@@ -1,15 +1,16 @@
 {
   "$schema": "/Users/mkuckert/.nono-here/nono-profile.schema.json",
   "extends": ["nolabs-ai/claude"],
+  "groups": { "include": ["rust_runtime"] },
   "meta": {
     "name": "ask_user_question_ui",
-    "version": "2"
+    "version": "4"
   },
   "workdir": {
     "access": "readwrite"
   },
   "filesystem": {
-    "allow": [],
+    "allow": ["~/.cargo/"],
     "deny": ["~/.gitconfig"],
     "read_file": [
       "~/.gitconfig-private",
@@ -25,6 +26,7 @@
   "network": {
     "allow_domain": []
   },
+  "allow_gpu": true,
   "environment": {
     "allow_vars": [
       "HOME",

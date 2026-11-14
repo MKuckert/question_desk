@@ -1,6 +1,6 @@
 # Spec: Question Desk — a GUI replacement for AskUserQuestion
 
-Status: ready-for-agent
+Status: done
 
 Related: `GLOSSARY.md`, ADR 0001–0005 in `docs/adr/`.
 
@@ -195,3 +195,7 @@ One binary crate, with a library target so tests and the demo client can use it.
 - Claude Code facts that shaped the design (docs): `MCP_TOOL_TIMEOUT` default ~28 h; `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` default 5 min for HTTP; `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` default 2 min. Spike 2 (Claude Code 2.1.311) confirmed: progress notifications are required (without them the call timed out after ~3 min; SSE keep-alive does not count), calls move to the background after 2 min and still deliver, and `permissions.deny: ["AskUserQuestion"]` or `--disallowedTools AskUserQuestion` disables the built-in tool (without it Claude Code prefers the built-in tool).
 - In the nono sandbox, `GIT_CONFIG_GLOBAL` from the profile is not present in the Agent's shell; git commands need it set explicitly.
 - Toolchain: Rust 1.99 available; `eframe`/`egui_commonmark` need MSRV 1.95, `rmcp` 1.88.
+
+## Comments
+
+- 2026-11-14: MVP delivered (delivery order steps 1–3 complete, up to commit `5359adf`). Out-of-scope items (persistence across restarts, history/export, tray icon, `egui_kittest` UI tests) remain for follow-up specs.

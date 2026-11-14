@@ -452,17 +452,20 @@ impl App {
             return;
         }
         let preview = self.preview(round, question, index);
+        // The layout must not depend on what is hovered: switching to columns moves and
+        // re-identifies the cards, which drops the hover and switches back, every frame.
+        let has_previews = question.options.iter().any(|o| o.preview.is_some());
         let wide = ui.available_width() >= WIDE_LAYOUT;
-        if let (Some(preview), true) = (&preview, wide) {
+        if has_previews && wide {
             ui.columns(2, |columns| {
                 self.option_cards(&mut columns[0], round, question, index);
-                preview_panel(&mut columns[1], preview);
+                preview_panel(&mut columns[1], preview.as_deref());
             });
         } else {
             self.option_cards(ui, round, question, index);
             if let Some(preview) = &preview {
                 ui.add_space(6.0);
-                preview_panel(ui, preview);
+                preview_panel(ui, Some(preview));
             }
         }
     }
@@ -818,7 +821,7 @@ fn option_card(
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn preview_panel(ui: &mut egui::Ui, preview: &str) {
+fn preview_panel(ui: &mut egui::Ui, preview: Option<&str>) {
     egui::Frame::group(ui.style())
         .fill(ui.visuals().extreme_bg_color)
         .show(ui, |ui| {
@@ -828,7 +831,14 @@ fn preview_panel(ui: &mut egui::Ui, preview: &str) {
                 .id_salt("preview")
                 .max_height(420.0)
                 .show(ui, |ui| {
-                    ui.label(RichText::new(preview).font(FontId::monospace(14.0)));
+                    match preview {
+                        Some(preview) => {
+                            ui.label(RichText::new(preview).font(FontId::monospace(14.0)));
+                        }
+                        None => {
+                            ui.label(RichText::new("Hover an option to see its preview.").weak());
+                        }
+                    }
                 });
         });
 }
