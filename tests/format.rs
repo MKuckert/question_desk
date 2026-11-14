@@ -159,3 +159,29 @@ fn a_long_single_line_note_also_switches_to_markdown_blocks() {
     **Note:** Fine for now, but revisit once we have more than one tenant, because the schema-per-tenant approach does not scale.
     ");
 }
+
+#[test]
+fn blank_lines_in_an_answer_keep_its_paragraphs_inside_the_section() {
+    let r = round(
+        Outcome::Submitted,
+        vec![q("Plan?", Some("First this.\n\n\nThen ## that."), None)],
+    );
+    insta::assert_snapshot!(format::text(&r), @r"
+    Your questions have been answered. You can now continue with these answers in mind.
+
+    ## Plan?
+
+    **Answer:** First this.
+
+    Then ## that.
+    ");
+}
+
+#[test]
+fn backslashes_in_one_line_answers_are_escaped_too() {
+    let r = round(
+        Outcome::Submitted,
+        vec![q("Path?", Some(r#"C:\temp\"x""#), None)],
+    );
+    insta::assert_snapshot!(format::text(&r), @r#"Your questions have been answered: "Path?"="C:\\temp\\\"x\"". You can now continue with these answers in mind."#);
+}

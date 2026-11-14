@@ -181,9 +181,12 @@ fn tool_error(message: impl Into<String>) -> CallToolResponse {
 }
 
 fn finished(result: &RoundResult) -> CallToolResponse {
-    let mut response = CallToolResult::success(vec![ContentBlock::text(format::text(result))]);
-    response.structured_content =
-        Some(serde_json::to_value(format::structured(result)).expect("output serializes"));
+    success(format::text(result), format::structured(result))
+}
+
+fn success(text: String, output: Output) -> CallToolResponse {
+    let mut response = CallToolResult::success(vec![ContentBlock::text(text)]);
+    response.structured_content = Some(serde_json::to_value(output).expect("output serializes"));
     response.into()
 }
 
@@ -261,10 +264,7 @@ impl Handler {
             None => {
                 let (text, output) =
                     format::pending(&input.ticket, attachment.title(), attachment.questions());
-                let mut response = CallToolResult::success(vec![ContentBlock::text(text)]);
-                response.structured_content =
-                    Some(serde_json::to_value(output).expect("output serializes"));
-                response.into()
+                success(text, output)
             }
         }
     }

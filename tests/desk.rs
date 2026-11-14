@@ -586,7 +586,7 @@ fn states(desk: &Desk) -> Vec<QuestionState> {
 
 #[tokio::test]
 async fn the_user_moves_freely_through_a_round_and_reviews_it() {
-    use QuestionState::{Answered, Current, Open};
+    use QuestionState::{Answered, Current, Unanswered};
     let h = start().await;
     let agent = h.agent().await;
     let _call =
@@ -596,10 +596,10 @@ async fn the_user_moves_freely_through_a_round_and_reviews_it() {
     h.select("nav").await;
 
     assert_eq!(h.desk.current().unwrap().step, Step::Question(0));
-    assert_eq!(states(&h.desk), [Current, Open, Open]);
+    assert_eq!(states(&h.desk), [Current, Unanswered, Unanswered]);
     h.desk.toggle_option(0);
     h.desk.next();
-    assert_eq!(states(&h.desk), [Answered, Current, Open]);
+    assert_eq!(states(&h.desk), [Answered, Current, Unanswered]);
     h.desk.go_to(2);
     h.desk.back();
     assert_eq!(h.desk.current().unwrap().step, Step::Question(1));
@@ -614,7 +614,7 @@ async fn the_user_moves_freely_through_a_round_and_reviews_it() {
     h.desk.review();
     let review = h.desk.current().unwrap();
     assert_eq!(review.step, Step::Review);
-    assert_eq!(states(&h.desk), [Answered, Open, Open]);
+    assert_eq!(states(&h.desk), [Answered, Unanswered, Unanswered]);
     assert_eq!(review.unanswered(), ["Second?", "Third?"]);
     h.desk.next();
     assert_eq!(

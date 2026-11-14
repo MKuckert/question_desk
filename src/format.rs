@@ -149,21 +149,41 @@ fn paragraph(text: &str) -> Vec<Event<'static>> {
 }
 
 /// `**label** text`, keeping the user's line breaks; the text is escaped by the writer.
+/// Blank lines start further paragraphs, so the text stays inside the section.
 fn labelled(label: &'static str, text: &str) -> Vec<Event<'static>> {
-    let mut events = vec![
-        Event::Start(Tag::Paragraph),
-        Event::Start(Tag::Strong),
-        Event::Text(label.into()),
-        Event::End(TagEnd::Strong),
-        Event::Text(" ".into()),
-    ];
-    for (i, line) in text.lines().enumerate() {
-        if i > 0 {
-            events.push(Event::SoftBreak);
+    let mut paragraphs: Vec<Vec<&str>> = vec![Vec::new()];
+    for line in text.lines() {
+        match paragraphs.last_mut() {
+            Some(current) if line.trim().is_empty() => {
+                if !current.is_empty() {
+                    paragraphs.push(Vec::new());
+                }
+            }
+            Some(current) => current.push(line),
+            None => unreachable!("starts with one paragraph"),
         }
-        events.push(Event::Text(line.to_owned().into()));
     }
-    events.push(Event::End(TagEnd::Paragraph));
+    paragraphs.retain(|p| !p.is_empty());
+
+    let mut events = Vec::new();
+    for (i, lines) in paragraphs.iter().enumerate() {
+        events.push(Event::Start(Tag::Paragraph));
+        if i == 0 {
+            events.extend([
+                Event::Start(Tag::Strong),
+                Event::Text(label.into()),
+                Event::End(TagEnd::Strong),
+                Event::Text(" ".into()),
+            ]);
+        }
+        for (j, line) in lines.iter().enumerate() {
+            if j > 0 {
+                events.push(Event::SoftBreak);
+            }
+            events.push(Event::Text((*line).to_owned().into()));
+        }
+        events.push(Event::End(TagEnd::Paragraph));
+    }
     events
 }
 
@@ -222,5 +242,5 @@ fn quoted_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
 }
 
 fn quoted(text: &str) -> String {
-    format!("\"{}\"", text.replace('"', "\\\""))
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }

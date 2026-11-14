@@ -121,8 +121,11 @@ pub struct QuestionView {
     /// A Recommendation that matches no Option label; matching ones badge the Option.
     pub recommendation_text: Option<String>,
     pub note: String,
-    /// What the Agent would receive for this Question right now.
+    /// The Answer the Agent would receive for this Question right now.
     pub answer: Option<String>,
+    /// The Note the Agent would receive next to the Answer; `None` when the Note is
+    /// itself the Answer or empty.
+    pub answer_note: Option<String>,
     pub state: QuestionState,
 }
 
@@ -138,7 +141,7 @@ pub struct OptionView {
 /// A Question's state in the step bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionState {
-    Open,
+    Unanswered,
     Answered,
     Current,
 }
@@ -302,7 +305,11 @@ impl Desk {
             .zip(&round.answers)
             .enumerate()
             .map(|(i, (question, draft))| {
-                let answer = answer(question, draft).answer;
+                let QuestionResult {
+                    answer,
+                    note: answer_note,
+                    ..
+                } = question_result(question, draft);
                 let recommended = question.recommended.as_deref();
                 let matches_option = question
                     .options
@@ -332,9 +339,10 @@ impl Desk {
                     } else if answer.is_some() {
                         QuestionState::Answered
                     } else {
-                        QuestionState::Open
+                        QuestionState::Unanswered
                     },
                     answer,
+                    answer_note,
                 }
             })
             .collect();
@@ -515,7 +523,7 @@ impl Round {
         self.questions
             .iter()
             .zip(&self.answers)
-            .filter(|(q, d)| answer(q, d).answer.is_some())
+            .filter(|(q, d)| question_result(q, d).answer.is_some())
             .count()
     }
 
@@ -542,14 +550,14 @@ impl Round {
                 .questions
                 .iter()
                 .zip(&self.answers)
-                .map(|(question, draft)| answer(question, draft))
+                .map(|(question, draft)| question_result(question, draft))
                 .collect(),
         }
     }
 }
 
 /// The Answer is the selected labels; without a selection the Note is the Answer.
-fn answer(question: &Question, draft: &Draft) -> QuestionResult {
+fn question_result(question: &Question, draft: &Draft) -> QuestionResult {
     let note = draft.note.trim();
     let note = (!note.is_empty()).then(|| note.to_owned());
     let (answer, note) = if draft.selected.is_empty() {

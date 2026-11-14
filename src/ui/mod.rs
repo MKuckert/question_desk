@@ -24,8 +24,8 @@ use crate::desk::{
 use grapheme::GraphemeText;
 
 const ZOOM_KEY: &str = "zoom_factor";
-/// Below this width the preview panel moves under the Options.
-const WIDE_LAYOUT: f32 = 900.0;
+/// Below this width of the page the preview panel moves under the Options.
+const WIDE_LAYOUT: f32 = 720.0;
 
 /// Starts the window and blocks until it is closed. `status` is shown in the empty state,
 /// e.g. the MCP URL or why the server could not start.
@@ -69,6 +69,7 @@ pub fn run(desk: Desk, status: String) -> eframe::Result {
                 dialog: None,
                 closing: false,
                 hovered_option: None,
+                note_focus: None,
                 markdown: CommonMarkCache::default(),
                 zoom: None,
             }))
@@ -95,6 +96,20 @@ fn set_text_sizes(ctx: &egui::Context) {
     });
 }
 
+/// The Option card under the mouse: Ticket, Question index, Option index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HoveredOption {
+    ticket: String,
+    question: usize,
+    option: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteFocus {
+    Enter,
+    Leave,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dialog {
     Cancel,
@@ -114,21 +129,23 @@ struct App {
     /// The user confirmed closing; let the next close request through.
     closing: bool,
     /// The Option card under the mouse, for the preview panel.
-    hovered_option: Option<(String, usize, usize)>,
+    hovered_option: Option<HoveredOption>,
+    /// Focus change for the Note field, decided before egui handles Tab/Esc itself.
+    note_focus: Option<NoteFocus>,
     markdown: CommonMarkCache,
     /// Last seen zoom factor (`Cmd +/-`), saved with the window size.
     zoom: Option<f32>,
 }
 
 impl eframe::App for App {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         #[cfg(target_os = "macos")]
         raw_input.events.extend(
             macos_text_input::take_pending()
                 .into_iter()
                 .map(egui::Event::Text),
         );
-        let _ = raw_input;
+        self.take_note_keys(ctx, raw_input);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -334,7 +351,7 @@ impl App {
         });
         let hint = match round.step {
             Step::Question(_) => {
-                "1–9 select · Tab note · ↩ accept recommendation · ⌘↩ next · ⌘⇧↩ back · Esc cancel"
+                "1–9 select · Tab note · ↩ accept recommendation · ⌘↩ next · ⌘⇧↩ back · Esc leave note / cancel"
             }
             Step::Review => "⌘↩ submit · ⌘⇧↩ back · Esc cancel",
         };
@@ -357,7 +374,9 @@ impl App {
                     QuestionState::Answered => {
                         (answered_color(ui), ui.visuals().strong_text_color())
                     }
-                    QuestionState::Open => (Color32::TRANSPARENT, ui.visuals().weak_text_color()),
+                    QuestionState::Unanswered => {
+                        (Color32::TRANSPARENT, ui.visuals().weak_text_color())
+                    }
                 };
                 let button = egui::Button::new(RichText::new((i + 1).to_string()).color(text))
                     .fill(fill)
@@ -453,8 +472,8 @@ impl App {
         let hovered = self
             .hovered_option
             .as_ref()
-            .filter(|(ticket, q, _)| ticket == &round.ticket && *q == index)
-            .and_then(|(_, _, o)| question.options.get(*o))
+            .filter(|h| h.ticket == round.ticket && h.question == index)
+            .and_then(|h| question.options.get(h.option))
             .and_then(|o| o.preview.clone());
         hovered.or_else(|| {
             question
@@ -483,14 +502,13 @@ impl App {
             }
             ui.add_space(4.0);
         }
-        let key = hovered.map(|o| (round.ticket.clone(), index, o));
-        if key.is_some()
-            || self
-                .hovered_option
-                .as_ref()
-                .is_some_and(|(t, q, _)| t == &round.ticket && *q == index)
-        {
-            self.hovered_option = key;
+        let on_this_question = |h: &HoveredOption| h.ticket == round.ticket && h.question == index;
+        if hovered.is_some() || self.hovered_option.as_ref().is_some_and(on_this_question) {
+            self.hovered_option = hovered.map(|option| HoveredOption {
+                ticket: round.ticket.clone(),
+                question: index,
+                option,
+            });
         }
     }
 
@@ -561,11 +579,8 @@ impl App {
                                     );
                                 }
                             }
-                            let selected = question.options.iter().any(|o| o.selected);
-                            if selected && !question.note.trim().is_empty() {
-                                ui.label(
-                                    RichText::new(format!("Note: {}", question.note.trim())).weak(),
-                                );
+                            if let Some(note) = &question.answer_note {
+                                ui.label(RichText::new(format!("Note: {note}")).weak());
                             }
                         })
                         .response
@@ -611,31 +626,32 @@ impl App {
             }
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            if note_focused {
-                ctx.memory_mut(|m| m.surrender_focus(note_id(&round.ticket, step_index(round))));
-            } else {
+        let Step::Question(index) = round.step else {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.dialog = Some(Dialog::Cancel);
             }
             return;
-        }
-        let Step::Question(index) = round.step else {
-            return;
         };
-        if note_focused || ctx.memory(|m| m.focused().is_some()) {
+        let note = note_id(&round.ticket, index);
+        match self.note_focus.take() {
+            Some(NoteFocus::Enter) => ctx.memory_mut(|m| m.request_focus(note)),
+            Some(NoteFocus::Leave) => ctx.memory_mut(|m| m.surrender_focus(note)),
+            None => {}
+        }
+        if note_focused {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
-            ctx.memory_mut(|m| m.request_focus(note_id(&round.ticket, index)));
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.dialog = Some(Dialog::Cancel);
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
-            let question = &round.questions[index];
-            if question.answer.is_none() {
-                self.desk.accept_recommendation();
-            } else {
-                self.desk.next();
-            }
+        // Enter accepts the Recommendation only while nothing is selected or noted.
+        let question = &round.questions[index];
+        let accepts = question.answer.is_none()
+            && (question.recommendation_text.is_some()
+                || question.options.iter().any(|o| o.recommended));
+        if accepts && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            self.desk.accept_recommendation();
             return;
         }
         const DIGITS: [Key; 9] = [
@@ -653,6 +669,32 @@ impl App {
             if ctx.input_mut(|input| input.consume_key(Modifiers::NONE, key)) {
                 self.desk.toggle_option(i);
             }
+        }
+    }
+
+    /// Tab moves into the Note and Esc leaves it. egui would otherwise move focus to
+    /// the next widget on Tab, and clear focus on Esc before `shortcuts` can tell that
+    /// Esc was meant for the Note rather than for cancelling the round.
+    fn take_note_keys(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(round) = self.desk.current() else {
+            return;
+        };
+        let Step::Question(index) = round.step else {
+            return;
+        };
+        let note_focused = ctx.memory(|m| m.has_focus(note_id(&round.ticket, index)));
+        let (key, focus) = if note_focused {
+            (Key::Escape, NoteFocus::Leave)
+        } else {
+            (Key::Tab, NoteFocus::Enter)
+        };
+        let is_key = |event: &egui::Event| matches!(event, egui::Event::Key { key: k, modifiers, .. } if *k == key && modifiers.is_none());
+        if raw_input.events.iter().any(is_key) {
+            raw_input.events.retain(|e| !is_key(e));
+            self.note_focus = Some(focus);
         }
     }
 
@@ -695,7 +737,8 @@ impl App {
                     decision = Some(false);
                 }
             });
-            if ui.input(|i| i.key_pressed(Key::Enter)) {
+            // Enter confirms only the harmless dialog; cancelling needs a click.
+            if dialog == Dialog::SubmitUnanswered && ui.input(|i| i.key_pressed(Key::Enter)) {
                 decision = Some(true);
             }
         });
@@ -800,13 +843,6 @@ fn chip(ui: &mut egui::Ui, text: &str) {
 
 fn note_id(ticket: &str, index: usize) -> egui::Id {
     egui::Id::unique(("note", ticket, index))
-}
-
-fn step_index(round: &RoundView) -> usize {
-    match round.step {
-        Step::Question(i) => i,
-        Step::Review => 0,
-    }
 }
 
 fn warn_color(ui: &egui::Ui) -> Color32 {

@@ -96,7 +96,7 @@ A repeated `ask_user_question` with the same Ticket and the same Questions reatt
 - Options are cards: click or press `1`–`9`. Single-select behaves like radio buttons, `multiSelect` like checkboxes.
 - The Recommended Option is badged, never pre-selected. A Recommendation that matches no Option is shown above the Options.
 - The Note field is always there. Without a selected Option, the Note is your Answer.
-- `Tab` focuses the Note, `Enter` (outside the Note) accepts the Recommendation and moves on, `⌘↩` / `Ctrl+Enter` goes to the next Question (Submit on the Review Page), `⌘⇧↩` goes back, `Esc` cancels after confirmation.
+- `Tab` focuses the Note and `Esc` leaves it. `Enter` outside the Note, with nothing selected or noted yet, accepts the Recommendation and moves on. `⌘↩` / `Ctrl+Enter` goes to the next Question (Submit on the Review Page), `⌘⇧↩` goes back, and `Esc` outside the Note cancels the round after confirmation.
 - The step bar and the Review Page jump to any Question. Submitting with Unanswered Questions asks first.
 - `⌘+` / `⌘-` zoom; zoom and window size are remembered.
 - Emoji: Edit → Emoji & Symbols or `Ctrl+⌘+Space` on macOS.
