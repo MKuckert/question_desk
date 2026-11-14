@@ -47,6 +47,30 @@ pub fn structured(result: &RoundResult) -> Output {
     }
 }
 
+/// What `wait_for_answers` returns while the user is still answering: text and
+/// `structuredContent`, both naming the round so the Agent can confirm it is its own.
+pub fn pending(ticket: &str, title: Option<&str>, questions: &[String]) -> (String, Output) {
+    let questions_list = quoted_list(questions.iter().map(String::as_str));
+    let round = match title {
+        Some(title) => format!("{}: {questions_list}", quoted(title)),
+        None => questions_list,
+    };
+    let text = format!(
+        "Still pending: the user has not finished question round {} ({round}) yet. Call wait_for_answers again.",
+        quoted(ticket)
+    );
+    let output = Output {
+        status: Status::Pending,
+        ticket: ticket.to_owned(),
+        answers: Default::default(),
+        annotations: Default::default(),
+        unanswered: Vec::new(),
+        title: title.map(str::to_owned),
+        questions: questions.to_vec(),
+    };
+    (text, output)
+}
+
 /// The text content of a finished round: one line for short Answers, Markdown blocks
 /// once any Answer or Note is long or spans several lines.
 pub fn text(result: &RoundResult) -> String {

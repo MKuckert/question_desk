@@ -33,6 +33,8 @@ struct Round {
     answers: Vec<Draft>,
     step: Step,
     result: watch::Sender<Option<RoundResult>>,
+    /// One clone per live [`Attachment`]; the count tells whether an Agent is waiting.
+    attached: Arc<()>,
 }
 
 /// What the user has entered for one Question so far.
@@ -60,14 +62,33 @@ pub struct SessionView {
 pub struct RoundSummary {
     pub ticket: String,
     pub title: Option<String>,
+    /// Whether any Agent call is currently waiting for this round's result.
+    pub connected: bool,
 }
 
 /// A call waiting for a round's result.
 pub struct Attachment {
+    ticket: String,
     result: watch::Receiver<Option<RoundResult>>,
+    _attached: Arc<()>,
+    title: Option<String>,
+    questions: Vec<String>,
 }
 
 impl Attachment {
+    pub fn ticket(&self) -> &str {
+        &self.ticket
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    /// The round's question texts, so a pending answer can identify the round.
+    pub fn questions(&self) -> &[String] {
+        &self.questions
+    }
+
     /// Resolves when the user Submits or Cancels the round.
     pub async fn finished(&mut self) -> RoundResult {
         let result = self
@@ -86,10 +107,20 @@ impl Desk {
 
     // ---- Agent side -------------------------------------------------------------------
 
-    /// Opens a Question Round for a validated `ask_user_question` call.
+    /// Opens a Question Round for a validated `ask_user_question` call, or reattaches to
+    /// the round with the same Ticket if its Questions are identical.
     pub fn ask(&self, input: AskInput, client: Option<String>) -> Result<Attachment, String> {
         let mut state = self.lock();
-        let (result, receiver) = watch::channel(None);
+        if let Some(round) = state.rounds.iter().find(|r| r.ticket == input.ticket) {
+            if round.questions != input.questions {
+                return Err(format!(
+                    "ticket {:?} is already used by a different question round; choose a new unique ticket",
+                    input.ticket
+                ));
+            }
+            return Ok(round.attach());
+        }
+        let (result, _) = watch::channel(None);
         let session = session_label(client.as_deref(), input.source.as_deref());
         state.rounds.push(Round {
             ticket: input.ticket,
@@ -99,8 +130,14 @@ impl Desk {
             questions: input.questions,
             step: Step::Question(0),
             result,
+            attached: Arc::new(()),
         });
-        Ok(Attachment { result: receiver })
+        Ok(state.rounds.last().expect("just pushed").attach())
+    }
+
+    /// Attaches to the round with this Ticket, open or finished; `None` if unknown.
+    pub fn pickup(&self, ticket: &str) -> Option<Attachment> {
+        self.lock().rounds.iter().find(|r| r.ticket == ticket).map(Round::attach)
     }
 
     // ---- User side --------------------------------------------------------------------
@@ -110,7 +147,11 @@ impl Desk {
         let state = self.lock();
         let mut sessions: Vec<SessionView> = Vec::new();
         for round in state.rounds.iter().filter(|r| r.is_open()) {
-            let summary = RoundSummary { ticket: round.ticket.clone(), title: round.title.clone() };
+            let summary = RoundSummary {
+                ticket: round.ticket.clone(),
+                title: round.title.clone(),
+                connected: Arc::strong_count(&round.attached) > 1,
+            };
             match sessions.iter_mut().find(|s| s.label == round.session) {
                 Some(session) => session.rounds.push(summary),
                 None => sessions.push(SessionView { label: round.session.clone(), rounds: vec![summary] }),
@@ -126,10 +167,23 @@ impl Desk {
         }
     }
 
-    /// Selects Option `index` of the current Question.
+    /// Toggles Option `index` of the current Question: like a checkbox for `multiSelect`,
+    /// like a radio button (that can be cleared again) otherwise.
     pub fn toggle_option(&self, index: usize) {
-        self.with_current_question(|_, draft| {
-            draft.selected = vec![index];
+        self.with_current_question(|question, draft| {
+            if index >= question.options.len() {
+                return;
+            }
+            let was_selected = draft.selected.contains(&index);
+            if !question.multi_select {
+                draft.selected.clear();
+            }
+            if was_selected {
+                draft.selected.retain(|&i| i != index);
+            } else {
+                draft.selected.push(index);
+                draft.selected.sort_unstable();
+            }
         });
     }
 
@@ -148,6 +202,10 @@ impl Desk {
 
     pub fn submit(&self) {
         self.finish(Outcome::Submitted);
+    }
+
+    pub fn cancel(&self) {
+        self.finish(Outcome::Cancelled);
     }
 
     fn finish(&self, outcome: Outcome) {
@@ -175,6 +233,16 @@ impl Desk {
 }
 
 impl Round {
+    fn attach(&self) -> Attachment {
+        Attachment {
+            ticket: self.ticket.clone(),
+            result: self.result.subscribe(),
+            _attached: self.attached.clone(),
+            title: self.title.clone(),
+            questions: self.questions.iter().map(|q| q.question.clone()).collect(),
+        }
+    }
+
     fn is_open(&self) -> bool {
         self.result.borrow().is_none()
     }
