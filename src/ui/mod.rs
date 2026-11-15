@@ -1,8 +1,10 @@
 //! The Question Desk window: renders the `desk` read model and dispatches user intents.
 
 mod grapheme;
+mod icons;
 #[cfg(target_os = "macos")]
 mod macos_text_input;
+mod theme;
 
 use std::{
     sync::{
@@ -13,19 +15,24 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Color32, FontId, Key, KeyboardShortcut, Modifiers, RichText, ScrollArea, Sense, Stroke,
-    TextEdit, TextStyle,
+    self, Color32, FontId, Frame, Key, KeyboardShortcut, Margin, Modifiers, RichText, ScrollArea,
+    Sense, Stroke, TextEdit, class::HasClasses as _,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::desk::{
-    Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundView, SessionView, Step,
+    Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundSummary, RoundView, SessionView,
+    Step,
 };
 use grapheme::GraphemeText;
+use icons::{button_icon, icon};
+use theme::{SPACE_L, SPACE_M, SPACE_S, SPACE_XS};
 
 const ZOOM_KEY: &str = "zoom_factor";
 /// Below this width of the page the preview panel moves under the Options.
 const WIDE_LAYOUT: f32 = 720.0;
+/// The widest the page content gets.
+const PAGE_WIDTH: f32 = 960.0;
 
 /// Starts the window and blocks until it is closed. `status` is shown in the empty state,
 /// e.g. the MCP URL or why the server could not start.
@@ -49,7 +56,7 @@ pub fn run(desk: Desk, status: String) -> eframe::Result {
                 .and_then(|z| z.parse::<f32>().ok())
                 .unwrap_or(1.0);
             cc.egui_ctx.set_zoom_factor(zoom);
-            set_text_sizes(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx);
 
             let attention = Arc::new(AtomicBool::new(false));
             let ctx = cc.egui_ctx.clone();
@@ -75,25 +82,6 @@ pub fn run(desk: Desk, status: String) -> eframe::Result {
             }))
         }),
     )
-}
-
-/// A larger base font than egui's default; long text should be comfortable to read.
-fn set_text_sizes(ctx: &egui::Context) {
-    ctx.global_style_mut(|style| {
-        for (text_style, size) in [
-            (TextStyle::Small, 12.0),
-            (TextStyle::Body, 16.0),
-            (TextStyle::Button, 16.0),
-            (TextStyle::Monospace, 14.0),
-            (TextStyle::Heading, 24.0),
-        ] {
-            if let Some(font) = style.text_styles.get_mut(&text_style) {
-                font.size = size;
-            }
-        }
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    });
 }
 
 /// The Option card under the mouse: Ticket, Question index, Option index.
@@ -170,25 +158,43 @@ impl App {
         let sessions = self.desk.sessions();
         let round = self.desk.current();
 
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, round.as_ref()));
+        let p = theme::of(ui);
+        let bar = Frame::new()
+            .fill(p.panel)
+            .inner_margin(Margin::symmetric(SPACE_L as i8, SPACE_S as i8));
+        egui::Panel::top("top")
+            .frame(bar)
+            .show(ui, |ui| self.top_bar(ui, round.as_ref()));
         if let Some(round) = &round {
-            egui::Panel::bottom("footer").show(ui, |ui| self.footer(ui, round));
+            egui::Panel::bottom("footer")
+                .frame(bar.inner_margin(Margin::symmetric(SPACE_L as i8, SPACE_M as i8)))
+                .show(ui, |ui| self.footer(ui, round));
         }
         let mut sidebar_open = self.sidebar_open;
         egui::Panel::left("sidebar")
             .resizable(true)
-            .default_size(240.0)
+            .default_size(260.0)
+            .min_size(200.0)
+            .frame(Frame::new().fill(p.panel).inner_margin(SPACE_M))
             .show_collapsible(ui, &mut sidebar_open, |ui| {
                 self.sidebar(ui, &sessions, round.as_ref())
             });
         self.sidebar_open = sidebar_open;
-        egui::CentralPanel::default().show(ui, |ui| match &round {
-            None => self.empty_state(ui),
-            Some(round) => match round.step {
-                Step::Question(i) => self.question_page(ui, round, i),
-                Step::Review => self.review_page(ui, round),
-            },
-        });
+        egui::CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .fill(p.bg)
+                    .inner_margin(Margin::symmetric(0, SPACE_L as i8)),
+            )
+            .show(ui, |ui| {
+                page_column(ui, |ui| match &round {
+                    None => self.empty_state(ui),
+                    Some(round) => match round.step {
+                        Step::Question(i) => self.question_page(ui, round, i),
+                        Step::Review => self.review_page(ui, round),
+                    },
+                })
+            });
 
         if let Some(round) = &round {
             self.shortcuts(&ctx, round);
@@ -231,45 +237,65 @@ impl App {
     // ---- Chrome ---------------------------------------------------------------------------
 
     fn top_bar(&mut self, ui: &mut egui::Ui, round: Option<&RoundView>) {
+        let p = theme::of(ui);
         ui.horizontal(|ui| {
-            let toggle = if self.sidebar_open { "⏴" } else { "☰" };
+            let (toggle, tip) = if self.sidebar_open {
+                (icons::PANEL_CLOSE, "Hide open rounds")
+            } else {
+                (icons::PANEL_OPEN, "Show open rounds")
+            };
             if ui
-                .button(toggle)
-                .on_hover_text("Show or hide open rounds")
+                .add(
+                    egui::Button::image(button_icon(toggle))
+                        .image_tint_follows_text_color(true)
+                        .with_class(theme::GHOST),
+                )
+                .on_hover_text(tip)
                 .clicked()
             {
                 self.sidebar_open = !self.sidebar_open;
             }
-            let Some(round) = round else {
-                ui.label(RichText::new("Question Desk").strong());
-                return;
-            };
-            ui.label(RichText::new(&round.session).weak());
-            if let Some(title) = &round.title {
-                ui.label(RichText::new(title).strong());
-            }
-            if !round.connected {
-                ui.label(RichText::new("⚠ Agent disconnected").color(warn_color(ui)))
-                    .on_hover_text(
-                        "No Agent call is waiting for this round. Your answers are kept; \
-                         the Agent can pick them up with its ticket.",
+            ui.add(icon(icons::LOGO, 20.0, p.accent));
+            ui.label(
+                RichText::new("Question Desk")
+                    .font(theme::semibold(theme::TEXT_BODY))
+                    .color(p.text_strong),
+            );
+            if let Some(round) = round {
+                ui.label(RichText::new("/").color(p.border_strong));
+                ui.label(RichText::new(&round.session).color(p.muted));
+                if let Some(title) = &round.title {
+                    ui.label(
+                        RichText::new(title)
+                            .font(theme::semibold(theme::TEXT_BODY))
+                            .color(p.text),
                     );
+                }
+                if !round.connected {
+                    ui.add(icon(icons::WARN, 16.0, p.warn));
+                    ui.label(RichText::new("Agent disconnected").color(p.warn))
+                        .on_hover_text(
+                            "No Agent call is waiting for this round. Your answers are kept; \
+                             the Agent can pick them up with its ticket.",
+                        );
+                }
             }
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match round.step {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::global_theme_preference_buttons(ui);
+                let Some(round) = round else { return };
+                ui.add_space(SPACE_S);
+                match round.step {
                     Step::Question(i) => {
                         ui.label(
                             RichText::new(format!("{} / {}", i + 1, round.questions.len()))
-                                .strong(),
+                                .font(theme::semibold(theme::TEXT_BUTTON))
+                                .color(p.muted),
                         );
-                        chip(ui, &round.questions[i].header);
+                        theme::neutral_chip(ui, &round.questions[i].header);
                     }
-                    Step::Review => {
-                        ui.label(RichText::new("Review").strong());
-                    }
-                },
-            );
+                    Step::Review => theme::neutral_chip(ui, "Review"),
+                }
+            });
         });
     }
 
@@ -279,32 +305,33 @@ impl App {
         sessions: &[SessionView],
         current: Option<&RoundView>,
     ) {
-        ui.add_space(4.0);
-        ui.label(RichText::new("Open rounds").strong());
-        ui.separator();
+        let p = theme::of(ui);
+        ui.label(
+            RichText::new("OPEN ROUNDS")
+                .font(theme::semibold(theme::TEXT_SMALL))
+                .color(p.muted),
+        );
+        ui.add_space(SPACE_XS);
         ScrollArea::vertical().show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = SPACE_XS;
             if sessions.is_empty() {
-                ui.label(RichText::new("None").weak());
+                ui.label(RichText::new("Nothing waiting").color(p.muted));
             }
             for session in sessions {
-                ui.add_space(6.0);
-                ui.label(RichText::new(&session.label).small().strong());
+                ui.add_space(SPACE_S);
+                ui.label(
+                    RichText::new(&session.label)
+                        .size(theme::TEXT_SMALL)
+                        .color(p.muted),
+                );
                 for round in &session.rounds {
                     let selected = current.is_some_and(|c| c.ticket == round.ticket);
-                    let name = round.title.as_deref().unwrap_or(&round.ticket);
-                    let mut text = format!(
-                        "{name}\n{}/{} answered · {}",
-                        round.answered,
-                        round.total,
-                        age(round.opened_at)
-                    );
-                    if round.new {
-                        text = format!("● {text}");
-                    }
-                    if !round.connected {
-                        text.push_str(" · ⚠ disconnected");
-                    }
-                    if ui.selectable_label(selected, text).clicked() {
+                    let text = round_entry(ui, round, selected);
+                    let button = egui::Button::new(text)
+                        .selected(selected)
+                        .with_class(theme::NAV)
+                        .min_size(egui::vec2(ui.available_width(), 0.0));
+                    if ui.add(button).clicked() {
                         self.desk.select(&round.ticket);
                     }
                 }
@@ -313,92 +340,88 @@ impl App {
     }
 
     fn empty_state(&mut self, ui: &mut egui::Ui) {
+        let p = theme::of(ui);
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() / 3.0);
+            ui.add(icon(icons::INBOX, 40.0, p.muted));
+            ui.add_space(SPACE_M);
             ui.heading("No open questions");
-            ui.add_space(8.0);
-            ui.label(RichText::new(&self.status).weak());
+            ui.add_space(SPACE_S);
+            ui.label(RichText::new(&self.status).color(p.muted));
         });
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, round: &RoundView) {
-        ui.add_space(4.0);
+        let p = theme::of(ui);
         ui.horizontal(|ui| {
-            if ui.button("Cancel round").clicked() {
+            let cancel = egui::Button::image_and_text(button_icon(icons::CLOSE), "Cancel round")
+                .image_tint_follows_text_color(true)
+                .with_class(theme::GHOST);
+            if ui.add(cancel).clicked() {
                 self.dialog = Some(Dialog::Cancel);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match round.step {
-                    Step::Question(_) => {
-                        if ui.button(RichText::new("Next ⏵").strong()).clicked() {
-                            self.desk.next();
-                        }
-                    }
-                    Step::Review => {
-                        if ui.button(RichText::new("Submit").strong()).clicked() {
-                            self.submit(round);
-                        }
+                let primary = match round.step {
+                    Step::Question(_) => ("Next", icons::NEXT),
+                    Step::Review => ("Submit", icons::SEND),
+                };
+                let button = egui::Button::new((primary.0, button_icon(primary.1)))
+                    .image_tint_follows_text_color(true)
+                    .with_class(theme::PRIMARY)
+                    .min_size(egui::vec2(112.0, 0.0));
+                if ui.add(button).clicked() {
+                    match round.step {
+                        Step::Question(_) => self.desk.next(),
+                        Step::Review => self.submit(round),
                     }
                 }
                 let at_start = round.step == Step::Question(0);
-                if ui
-                    .add_enabled(!at_start, egui::Button::new("⏴ Back"))
-                    .clicked()
-                {
+                let back = egui::Button::image_and_text(button_icon(icons::BACK), "Back")
+                    .image_tint_follows_text_color(true);
+                if ui.add_enabled(!at_start, back).clicked() {
                     self.desk.back();
                 }
+                let hint = match round.step {
+                    Step::Question(_) => {
+                        "1–9 select · Tab note · ↩ accept recommendation · ⌘↩ next · ⌘⇧↩ back · Esc leave note / cancel"
+                    }
+                    Step::Review => "⌘↩ submit · ⌘⇧↩ back · Esc cancel",
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(hint.replace('⌘', cmd_symbol()))
+                            .size(theme::TEXT_SMALL)
+                            .color(p.muted),
+                    )
+                    .truncate(),
+                );
             });
         });
-        let hint = match round.step {
-            Step::Question(_) => {
-                "1–9 select · Tab note · ↩ accept recommendation · ⌘↩ next · ⌘⇧↩ back · Esc leave note / cancel"
-            }
-            Step::Review => "⌘↩ submit · ⌘⇧↩ back · Esc cancel",
-        };
-        ui.label(
-            RichText::new(hint.replace('⌘', cmd_symbol()))
-                .small()
-                .weak(),
-        );
-        ui.add_space(2.0);
     }
 
     fn step_bar(&mut self, ui: &mut egui::Ui, round: &RoundView) {
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = SPACE_XS + 2.0;
             for (i, question) in round.questions.iter().enumerate() {
-                let (fill, text) = match question.state {
-                    QuestionState::Current => (
-                        ui.visuals().selection.bg_fill,
-                        ui.visuals().strong_text_color(),
-                    ),
-                    QuestionState::Answered => {
-                        (answered_color(ui), ui.visuals().strong_text_color())
-                    }
-                    QuestionState::Unanswered => {
-                        (Color32::TRANSPARENT, ui.visuals().weak_text_color())
-                    }
+                let class = match question.state {
+                    QuestionState::Current => Some(theme::STEP_CURRENT),
+                    QuestionState::Answered => Some(theme::STEP_DONE),
+                    QuestionState::Unanswered => None,
                 };
-                let button = egui::Button::new(RichText::new((i + 1).to_string()).color(text))
-                    .fill(fill)
-                    .min_size(egui::vec2(32.0, 26.0));
+                let button = egui::Button::new((i + 1).to_string())
+                    .with_class(theme::STEP)
+                    .with_class_if(class.unwrap_or_default(), class.is_some())
+                    .min_size(egui::vec2(32.0, 28.0));
                 if ui.add(button).on_hover_text(&question.question).clicked() {
                     self.desk.go_to(i);
                 }
             }
             let review = round.step == Step::Review;
-            let fill = if review {
-                ui.visuals().selection.bg_fill
-            } else {
-                Color32::TRANSPARENT
-            };
-            if ui
-                .add(
-                    egui::Button::new("Review")
-                        .fill(fill)
-                        .min_size(egui::vec2(32.0, 26.0)),
-                )
-                .clicked()
-            {
+            let button = egui::Button::new("Review")
+                .with_class(theme::STEP)
+                .with_class_if(theme::STEP_CURRENT, review)
+                .min_size(egui::vec2(32.0, 28.0));
+            if ui.add(button).clicked() {
                 self.desk.review();
             }
         });
@@ -407,16 +430,21 @@ impl App {
     // ---- Question page --------------------------------------------------------------------
 
     fn question_page(&mut self, ui: &mut egui::Ui, round: &RoundView, index: usize) {
+        let p = theme::of(ui);
         let question = &round.questions[index];
         self.step_bar(ui, round);
-        ui.add_space(8.0);
+        ui.add_space(SPACE_L);
         ScrollArea::vertical()
             .id_salt(("page", &round.ticket, index))
             .show(ui, |ui| {
-                ui.label(RichText::new(&question.question).heading().strong());
-                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&question.question)
+                        .font(theme::semibold(theme::TEXT_TITLE))
+                        .color(p.text_strong),
+                );
+                ui.add_space(SPACE_S);
                 if let Some(body) = &question.body {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                    card_frame(p.surface, Stroke::new(1.0, p.border)).show(ui, |ui| {
                         ScrollArea::vertical()
                             .id_salt(("body", &round.ticket, index))
                             .max_height((ui.ctx().content_rect().height() * 0.35).max(120.0))
@@ -425,17 +453,18 @@ impl App {
                                 CommonMarkViewer::new().show(ui, &mut self.markdown, body);
                             });
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(SPACE_M);
                 }
                 if let Some(recommendation) = &question.recommendation_text {
                     ui.horizontal_wrapped(|ui| {
-                        chip(ui, "Recommended");
+                        ui.add(icon(icons::SPARKLES, 16.0, p.accent));
+                        theme::accent_chip(ui, "Recommended");
                         ui.label(recommendation);
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(SPACE_S);
                 }
                 self.options_and_preview(ui, round, question, index);
-                ui.add_space(8.0);
+                ui.add_space(SPACE_L);
                 self.note_field(ui, round, question, index);
             });
     }
@@ -448,7 +477,10 @@ impl App {
         index: usize,
     ) {
         if question.options.is_empty() {
-            ui.label(RichText::new("Open question: answer in the note below.").weak());
+            ui.label(
+                RichText::new("Open question: answer in the note below.")
+                    .color(theme::of(ui).muted),
+            );
             return;
         }
         let preview = self.preview(round, question, index);
@@ -464,7 +496,7 @@ impl App {
         } else {
             self.option_cards(ui, round, question, index);
             if let Some(preview) = &preview {
-                ui.add_space(6.0);
+                ui.add_space(SPACE_S);
                 preview_panel(ui, Some(preview));
             }
         }
@@ -503,7 +535,7 @@ impl App {
             if response.clicked() {
                 self.desk.toggle_option(i);
             }
-            ui.add_space(4.0);
+            ui.add_space(SPACE_XS);
         }
         let on_this_question = |h: &HoveredOption| h.ticket == round.ticket && h.question == index;
         if hovered.is_some() || self.hovered_option.as_ref().is_some_and(on_this_question) {
@@ -529,13 +561,18 @@ impl App {
         } else {
             "Note: without a selected option, this text is your answer"
         };
-        ui.label(RichText::new("Note").strong());
+        ui.label(
+            RichText::new("Note")
+                .font(theme::semibold(theme::TEXT_BUTTON))
+                .color(theme::of(ui).text_strong),
+        );
         let mut note = question.note.clone();
         let mut buffer = GraphemeText(&mut note);
         let edit = TextEdit::multiline(&mut buffer)
             .id(note_id(&round.ticket, index))
             .hint_text(hint)
-            .desired_rows(2)
+            .desired_rows(3)
+            .margin(Margin::same(SPACE_M as i8))
             .desired_width(f32::INFINITY);
         let response = grapheme::show(ui, edit);
         if response.changed() {
@@ -546,54 +583,71 @@ impl App {
     // ---- Review page ----------------------------------------------------------------------
 
     fn review_page(&mut self, ui: &mut egui::Ui, round: &RoundView) {
+        let p = theme::of(ui);
         self.step_bar(ui, round);
-        ui.add_space(8.0);
+        ui.add_space(SPACE_L);
         ui.heading("Review your answers");
         let unanswered = round.unanswered().len();
         if unanswered > 0 {
-            ui.label(
-                RichText::new(format!("{unanswered} question(s) unanswered")).color(warn_color(ui)),
-            );
+            ui.horizontal(|ui| {
+                ui.add(icon(icons::WARN, 16.0, p.warn));
+                ui.label(
+                    RichText::new(format!("{unanswered} question(s) unanswered")).color(p.warn),
+                );
+            });
         }
-        ui.add_space(6.0);
+        ui.add_space(SPACE_S);
         ScrollArea::vertical()
             .id_salt(("review", &round.ticket))
             .show(ui, |ui| {
                 for (i, question) in round.questions.iter().enumerate() {
-                    let response = egui::Frame::group(ui.style())
-                        .stroke(match question.answer {
-                            None => Stroke::new(1.5, warn_color(ui)),
-                            Some(_) => ui.visuals().widgets.noninteractive.bg_stroke,
-                        })
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
+                    let answered = question.answer.is_some();
+                    let response = clickable_card(
+                        ui,
+                        |hovered| {
+                            let border = match (answered, hovered) {
+                                (false, _) => p.warn,
+                                (true, true) => p.border_strong,
+                                (true, false) => p.border,
+                            };
+                            let fill = if hovered { p.hover } else { p.surface };
+                            (fill, Stroke::new(1.0, border))
+                        },
+                        |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(format!("{}.", i + 1)).weak());
-                                chip(ui, &question.header);
-                                ui.label(RichText::new(&question.question).strong());
+                                let (mark, color) = if answered {
+                                    (icons::DONE, p.success)
+                                } else {
+                                    (icons::WARN, p.warn)
+                                };
+                                ui.add(icon(mark, 16.0, color));
+                                ui.label(RichText::new(format!("{}.", i + 1)).color(p.muted));
+                                theme::neutral_chip(ui, &question.header);
+                                ui.label(
+                                    RichText::new(&question.question)
+                                        .font(theme::semibold(theme::TEXT_BODY))
+                                        .color(p.text_strong),
+                                );
                             });
+                            ui.add_space(SPACE_XS);
                             match &question.answer {
                                 Some(answer) => {
                                     ui.label(answer);
                                 }
                                 None => {
-                                    ui.label(
-                                        RichText::new("Unanswered").italics().color(warn_color(ui)),
-                                    );
+                                    ui.label(RichText::new("Unanswered").italics().color(p.warn));
                                 }
                             }
                             if let Some(note) = &question.answer_note {
-                                ui.label(RichText::new(format!("Note: {note}")).weak());
+                                ui.label(RichText::new(format!("Note: {note}")).color(p.muted));
                             }
-                        })
-                        .response
-                        .interact(Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Edit this answer");
+                        },
+                    )
+                    .on_hover_text("Edit this answer");
                     if response.clicked() {
                         self.desk.go_to(i);
                     }
-                    ui.add_space(4.0);
+                    ui.add_space(SPACE_XS);
                 }
             });
     }
@@ -727,24 +781,36 @@ impl App {
             ),
         };
         let mut decision = None;
-        let modal = egui::Modal::new(egui::Id::unique("dialog")).show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            ui.heading(title);
-            ui.label(text);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new(confirm).strong()).clicked() {
+        let confirm_class = match dialog {
+            Dialog::SubmitUnanswered => theme::PRIMARY,
+            Dialog::Cancel | Dialog::Close => theme::DANGER,
+        };
+        let style = ctx.global_style();
+        let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
+        let modal = egui::Modal::new(egui::Id::unique("dialog"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.heading(title);
+                ui.add_space(SPACE_XS);
+                ui.label(RichText::new(text).color(theme::of(ui).muted));
+                ui.add_space(SPACE_L);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(confirm).with_class(confirm_class))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Keep answering").clicked() {
+                        decision = Some(false);
+                    }
+                });
+                // Enter confirms only the harmless dialog; cancelling needs a click.
+                if dialog == Dialog::SubmitUnanswered && ui.input(|i| i.key_pressed(Key::Enter)) {
                     decision = Some(true);
                 }
-                if ui.button("Keep answering").clicked() {
-                    decision = Some(false);
-                }
             });
-            // Enter confirms only the harmless dialog; cancelling needs a click.
-            if dialog == Dialog::SubmitUnanswered && ui.input(|i| i.key_pressed(Key::Enter)) {
-                decision = Some(true);
-            }
-        });
         if modal.should_close() && decision.is_none() {
             decision = Some(false);
         }
@@ -767,104 +833,193 @@ impl App {
     }
 }
 
+/// The page content: centered and at most `PAGE_WIDTH` wide, so long lines stay readable.
+fn page_column(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let side = ((ui.available_width() - PAGE_WIDTH) / 2.0).max(SPACE_L * 2.0);
+    let rect = ui
+        .available_rect_before_wrap()
+        .shrink2(egui::vec2(side, 0.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), add_contents);
+}
+
+fn card_frame(fill: Color32, stroke: Stroke) -> Frame {
+    Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(theme::RADIUS)
+        .inner_margin(SPACE_M)
+}
+
+/// A full-width card that reacts to the mouse; `style` maps "hovered" to fill and border.
+fn clickable_card(
+    ui: &mut egui::Ui,
+    style: impl Fn(bool) -> (Color32, Stroke),
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let (fill, stroke) = style(false);
+    let mut prepared = card_frame(fill, stroke).begin(ui);
+    prepared
+        .content_ui
+        .set_width(prepared.content_ui.available_width());
+    add_contents(&mut prepared.content_ui);
+    let response = prepared.allocate_space(ui).interact(Sense::click());
+    (prepared.frame.fill, prepared.frame.stroke) = style(response.hovered());
+    prepared.paint(ui);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 fn option_card(
     ui: &mut egui::Ui,
     option: &OptionView,
     index: usize,
     multi_select: bool,
 ) -> egui::Response {
-    let visuals = ui.visuals().clone();
-    let stroke = if option.selected {
-        Stroke::new(2.0, visuals.selection.stroke.color)
-    } else {
-        visuals.widgets.inactive.bg_stroke
-    };
-    let fill = if option.selected {
-        visuals.selection.bg_fill.gamma_multiply(0.35)
-    } else {
-        visuals.faint_bg_color
-    };
-    let inner = egui::Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(8.0)
-        .inner_margin(12.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+    let p = theme::of(ui);
+    let selected = option.selected;
+    clickable_card(
+        ui,
+        |hovered| match (selected, hovered) {
+            (true, _) => (theme::tint(p.accent, 0.12), Stroke::new(1.5, p.accent)),
+            (false, true) => (p.hover, Stroke::new(1.0, p.border_strong)),
+            (false, false) => (p.surface, Stroke::new(1.0, p.border)),
+        },
+        |ui| {
             ui.horizontal(|ui| {
-                let mark = match (multi_select, option.selected) {
-                    (true, true) => "☑",
-                    (true, false) => "☐",
-                    (false, true) => "◉",
-                    (false, false) => "○",
-                };
-                ui.label(RichText::new(mark).size(20.0));
+                ui.spacing_mut().item_spacing.x = SPACE_M;
+                selection_mark(ui, multi_select, selected);
                 ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = SPACE_XS;
                     ui.horizontal_wrapped(|ui| {
                         if index < 9 {
-                            ui.label(RichText::new((index + 1).to_string()).weak().monospace());
+                            key_badge(ui, &(index + 1).to_string());
                         }
-                        ui.label(RichText::new(&option.label).strong());
+                        ui.label(
+                            RichText::new(&option.label)
+                                .font(theme::semibold(theme::TEXT_BODY))
+                                .color(p.text_strong),
+                        );
                         if option.recommended {
-                            chip(ui, "Recommended");
+                            theme::accent_chip(ui, "Recommended");
                         }
                     });
                     if !option.description.is_empty() {
-                        ui.label(&option.description);
+                        ui.label(RichText::new(&option.description).color(p.text));
                     }
                 });
             });
+        },
+    )
+}
+
+/// A radio dot or checkbox, painted in the accent when selected.
+fn selection_mark(ui: &mut egui::Ui, multi_select: bool, selected: bool) {
+    let p = theme::of(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
+    let painter = ui.painter();
+    let (fill, stroke) = if selected {
+        (p.accent, Stroke::new(1.5, p.accent))
+    } else {
+        (p.surface, Stroke::new(1.5, p.border_strong))
+    };
+    if multi_select {
+        painter.rect(rect, 5.0, fill, stroke, egui::StrokeKind::Inside);
+        if selected {
+            icon(icons::CHECK, 14.0, p.on_accent).paint_at(ui, rect.shrink(3.0));
+        }
+    } else {
+        painter.circle(rect.center(), 9.25, fill, stroke);
+        if selected {
+            painter.circle_filled(rect.center(), 4.0, p.on_accent);
+        }
+    }
+}
+
+/// The digit that selects an Option, styled as a key cap.
+fn key_badge(ui: &mut egui::Ui, key: &str) {
+    let p = theme::of(ui);
+    Frame::new()
+        .fill(p.sunken)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(5)
+        .inner_margin(Margin::symmetric(6, 0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(key)
+                    .font(FontId::monospace(theme::TEXT_SMALL))
+                    .color(p.muted),
+            )
         });
-    inner
-        .response
-        .interact(Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn preview_panel(ui: &mut egui::Ui, preview: Option<&str>) {
-    egui::Frame::group(ui.style())
-        .fill(ui.visuals().extreme_bg_color)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new("Preview").small().weak());
-            ScrollArea::both()
-                .id_salt("preview")
-                .max_height(420.0)
-                .show(ui, |ui| {
-                    match preview {
-                        Some(preview) => {
-                            ui.label(RichText::new(preview).font(FontId::monospace(14.0)));
-                        }
-                        None => {
-                            ui.label(RichText::new("Hover an option to see its preview.").weak());
-                        }
-                    }
-                });
+    let p = theme::of(ui);
+    card_frame(p.sunken, Stroke::new(1.0, p.border)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.add(icon(icons::EYE, 14.0, p.muted));
+            ui.label(
+                RichText::new("PREVIEW")
+                    .font(theme::semibold(theme::TEXT_SMALL))
+                    .color(p.muted),
+            );
         });
+        ScrollArea::both()
+            .id_salt("preview")
+            .max_height(420.0)
+            .show(ui, |ui| match preview {
+                Some(preview) => {
+                    ui.label(
+                        RichText::new(preview)
+                            .font(FontId::monospace(theme::TEXT_MONO))
+                            .color(p.text),
+                    );
+                }
+                None => {
+                    ui.label(RichText::new("Hover an option to see its preview.").color(p.muted));
+                }
+            });
+    });
 }
 
-fn chip(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::new()
-        .fill(ui.visuals().widgets.inactive.bg_fill)
-        .corner_radius(10.0)
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| ui.label(RichText::new(text).small().strong()));
+/// A sidebar entry: title, progress and age, flags for new and disconnected rounds.
+fn round_entry(ui: &egui::Ui, round: &RoundSummary, selected: bool) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let p = theme::of(ui);
+    let mut job = LayoutJob::default();
+    let title_color = if selected { p.text_strong } else { p.text };
+    if round.new {
+        job.append(
+            "● ",
+            0.0,
+            TextFormat::simple(theme::semibold(theme::TEXT_BUTTON), p.accent),
+        );
+    }
+    let name = round.title.as_deref().unwrap_or(&round.ticket);
+    job.append(
+        name,
+        0.0,
+        TextFormat::simple(theme::semibold(theme::TEXT_BUTTON), title_color),
+    );
+    let mut meta = format!(
+        "\n{}/{} answered · {}",
+        round.answered,
+        round.total,
+        age(round.opened_at)
+    );
+    if !round.connected {
+        meta.push_str(" · ⚠ disconnected");
+    }
+    let meta_color = if round.connected { p.muted } else { p.warn };
+    job.append(
+        &meta,
+        0.0,
+        TextFormat::simple(FontId::proportional(theme::TEXT_SMALL), meta_color),
+    );
+    job
 }
 
 fn note_id(ticket: &str, index: usize) -> egui::Id {
     egui::Id::unique(("note", ticket, index))
-}
-
-fn warn_color(ui: &egui::Ui) -> Color32 {
-    ui.visuals().warn_fg_color
-}
-
-fn answered_color(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(40, 90, 55)
-    } else {
-        Color32::from_rgb(190, 230, 200)
-    }
 }
 
 fn cmd_symbol() -> &'static str {
