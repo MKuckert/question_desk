@@ -11,3 +11,7 @@ Uses the five default triage labels (`needs-triage`, `needs-info`, `ready-for-ag
 ### Domain docs
 
 Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Seeing the UI
+
+To check a UI change visually, run `tools/screenshot.sh [-o OUT.png] [demo rounds…]` and read the PNG it prints (`--help` for details). It captures the Question Desk window only, which keeps the user's other windows private; take every screenshot through it rather than `screencapture` directly.
