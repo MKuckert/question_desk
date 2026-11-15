@@ -306,11 +306,17 @@ impl App {
         current: Option<&RoundView>,
     ) {
         let p = theme::of(ui);
-        ui.label(
-            RichText::new("OPEN ROUNDS")
-                .font(theme::semibold(theme::TEXT_SMALL))
-                .color(p.muted),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("OPEN ROUNDS")
+                    .font(theme::semibold(theme::TEXT_SMALL))
+                    .color(p.muted),
+            );
+            let open: usize = sessions.iter().map(|s| s.rounds.len()).sum();
+            if open > 0 {
+                theme::neutral_chip(ui, &open.to_string());
+            }
+        });
         ui.add_space(SPACE_XS);
         ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = SPACE_XS;
@@ -327,7 +333,11 @@ impl App {
                 for round in &session.rounds {
                     let selected = current.is_some_and(|c| c.ticket == round.ticket);
                     let text = round_entry(ui, round, selected);
-                    let button = egui::Button::new(text)
+                    let mut button = egui::Button::new(text);
+                    if round.new {
+                        button = button.right_text(new_badge(ui));
+                    }
+                    let button = button
                         .selected(selected)
                         .with_class(theme::NAV)
                         .min_size(egui::vec2(ui.available_width(), 0.0));
@@ -352,7 +362,6 @@ impl App {
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, round: &RoundView) {
-        let p = theme::of(ui);
         ui.horizontal(|ui| {
             let cancel = egui::Button::image_and_text(button_icon(icons::CLOSE), "Cancel round")
                 .image_tint_follows_text_color(true)
@@ -381,22 +390,10 @@ impl App {
                 if ui.add_enabled(!at_start, back).clicked() {
                     self.desk.back();
                 }
-                let hint = match round.step {
-                    Step::Question(_) => {
-                        "1–9 select · Tab note · ↩ accept recommendation · ⌘↩ next · ⌘⇧↩ back · Esc leave note / cancel"
-                    }
-                    Step::Review => "⌘↩ submit · ⌘⇧↩ back · Esc cancel",
-                };
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(hint.replace('⌘', cmd_symbol()))
-                            .size(theme::TEXT_SMALL)
-                            .color(p.muted),
-                    )
-                    .truncate(),
-                );
             });
         });
+        ui.add_space(SPACE_XS);
+        shortcut_hints(ui, round.step);
     }
 
     fn step_bar(&mut self, ui: &mut egui::Ui, round: &RoundView) {
@@ -934,7 +931,7 @@ fn selection_mark(ui: &mut egui::Ui, multi_select: bool, selected: bool) {
     }
 }
 
-/// The digit that selects an Option, styled as a key cap.
+/// A key, e.g. the digit that selects an Option, styled as a key cap.
 fn key_badge(ui: &mut egui::Ui, key: &str) {
     let p = theme::of(ui);
     Frame::new()
@@ -945,10 +942,36 @@ fn key_badge(ui: &mut egui::Ui, key: &str) {
         .show(ui, |ui| {
             ui.label(
                 RichText::new(key)
-                    .font(FontId::monospace(theme::TEXT_SMALL))
+                    .font(FontId::proportional(theme::TEXT_SMALL))
                     .color(p.muted),
             )
         });
+}
+
+/// The keyboard shortcuts of the current step: key caps with a short label, wrapping in narrow
+/// windows.
+fn shortcut_hints(ui: &mut egui::Ui, step: Step) {
+    let cmd = cmd_symbol();
+    let hints: &[(&str, &str)] = match step {
+        Step::Question(_) => &[
+            ("1–9", "select"),
+            ("Tab", "note"),
+            ("↩", "accept recommendation"),
+            ("⌘↩", "next"),
+            ("⌘⇧↩", "back"),
+            ("Esc", "leave note / cancel"),
+        ],
+        Step::Review => &[("⌘↩", "submit"), ("⌘⇧↩", "back"), ("Esc", "cancel")],
+    };
+    let p = theme::of(ui);
+    ui.horizontal_wrapped(|ui| {
+        for (key, label) in hints {
+            ui.spacing_mut().item_spacing.x = SPACE_XS;
+            key_badge(ui, &key.replace('⌘', cmd));
+            ui.label(RichText::new(*label).size(theme::TEXT_SMALL).color(p.muted));
+            ui.add_space(SPACE_M - SPACE_XS);
+        }
+    });
 }
 
 fn preview_panel(ui: &mut egui::Ui, preview: Option<&str>) {
@@ -981,19 +1004,12 @@ fn preview_panel(ui: &mut egui::Ui, preview: Option<&str>) {
     });
 }
 
-/// A sidebar entry: title, progress and age, flags for new and disconnected rounds.
+/// A sidebar entry: title, progress and age, flag for disconnected rounds.
 fn round_entry(ui: &egui::Ui, round: &RoundSummary, selected: bool) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let p = theme::of(ui);
     let mut job = LayoutJob::default();
     let title_color = if selected { p.text_strong } else { p.text };
-    if round.new {
-        job.append(
-            "● ",
-            0.0,
-            TextFormat::simple(theme::semibold(theme::TEXT_BUTTON), p.accent),
-        );
-    }
     let name = round.title.as_deref().unwrap_or(&round.ticket);
     job.append(
         name,
@@ -1016,6 +1032,22 @@ fn round_entry(ui: &egui::Ui, round: &RoundSummary, selected: bool) -> egui::tex
         TextFormat::simple(FontId::proportional(theme::TEXT_SMALL), meta_color),
     );
     job
+}
+
+/// The "New" badge of a round the user has not looked at, laid out inside its sidebar entry.
+fn new_badge(ui: &egui::Ui) -> egui::Atom<'static> {
+    let p = theme::of(ui);
+    let galley = ui.painter().layout_no_wrap(
+        "New".to_owned(),
+        theme::semibold(theme::TEXT_SMALL),
+        p.on_accent,
+    );
+    let padding = egui::vec2(SPACE_S, 2.0);
+    egui::Atom::paint(galley.size() + 2.0 * padding, move |ui, args| {
+        let painter = ui.painter();
+        painter.rect_filled(args.rect, theme::RADIUS, p.accent);
+        painter.galley(args.rect.min + padding, galley.clone(), p.on_accent);
+    })
 }
 
 fn note_id(ticket: &str, index: usize) -> egui::Id {
