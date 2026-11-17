@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag like `v0.1.0` (matching `version` in Cargo.toml) to build the
-# app for every target and attach the archives to a GitHub Release.
+# Push a tag like `v0.1.0` to build the app for every target and attach the
+# archives to a GitHub Release. The release version comes from the tag; the
+# `version` in Cargo.toml does not need to match.
 on:
   push:
     tags: ["v*"]
@@ -35,14 +36,22 @@ jobs:
         with:
           ref: ${{ env.TAG }}
 
-      - name: Check tag matches Cargo.toml version
+      # The tag is the source of truth for the release version: stamp it into
+      # Cargo.toml and Cargo.lock (so `--locked` still passes) before building.
+      - name: Set version from tag
         shell: bash
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "v$version" != "$TAG" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+          version="${TAG#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $TAG is not a semver version like v1.2.3"
             exit 1
           fi
+          export VERSION="$version"
+          perl -0pi -e 's/(\[package\]\nname = "question-desk"\nversion = )"[^"]*"/$1"$ENV{VERSION}"/' Cargo.toml
+          perl -0pi -e 's/(\[\[package\]\]\nname = "question-desk"\nversion = )"[^"]*"/$1"$ENV{VERSION}"/' Cargo.lock
+          grep -q "^version = \"$version\"" Cargo.toml || { echo "::error::Failed to set version in Cargo.toml"; exit 1; }
+          grep -A1 '^name = "question-desk"$' Cargo.lock | grep -q "^version = \"$version\"" || { echo "::error::Failed to set version in Cargo.lock"; exit 1; }
+          echo "Building version $version"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
