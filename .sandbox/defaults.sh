@@ -7,4 +7,5 @@
 SANDBOX_COMMAND="claude"
 SANDBOX_COMMAND_DEFAULTS=(
   --allowed-tools "Grep Glob"
+  --disallowed-tools "AskUserQuestion"
 )
