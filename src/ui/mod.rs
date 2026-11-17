@@ -7,6 +7,7 @@ mod macos_text_input;
 mod theme;
 
 use std::{
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,9 +21,13 @@ use eframe::egui::{
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
-use crate::desk::{
-    Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundSummary, RoundView, SessionView,
-    Step,
+use crate::{
+    config::{self, Config},
+    desk::{
+        Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundSummary, RoundView,
+        SessionView, Step,
+    },
+    server::{DEFAULT_HOST, DEFAULT_PORT, ServerControl},
 };
 use grapheme::GraphemeText;
 use icons::{button_icon, icon};
@@ -34,9 +39,26 @@ const WIDE_LAYOUT: f32 = 720.0;
 /// The widest the page content gets.
 const PAGE_WIDTH: f32 = 960.0;
 
-/// Starts the window and blocks until it is closed. `status` is shown in the empty state,
-/// e.g. the MCP URL or why the server could not start.
-pub fn run(desk: Desk, status: String) -> eframe::Result {
+/// Starts the MCP server with `config`, then the window, and blocks until it is closed. If
+/// the config could not be loaded, the server stays off until the user saves the settings.
+pub fn run(
+    desk: Desk,
+    mut server: ServerControl,
+    config: Result<Config, String>,
+) -> eframe::Result {
+    let (config, status) = match config {
+        Ok(config) => {
+            let status = server_status(server.restart(config.server_settings()));
+            (config, status)
+        }
+        Err(e) => {
+            log::error!("{e}");
+            (
+                Config::default(),
+                format!("The settings could not be read: {e}"),
+            )
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
@@ -69,11 +91,14 @@ pub fn run(desk: Desk, status: String) -> eframe::Result {
             });
             Ok(Box::new(App {
                 desk,
+                server,
+                config,
                 status,
                 attention,
                 restore_window_level: false,
                 sidebar_open: true,
                 dialog: None,
+                settings: None,
                 closing: false,
                 hovered_option: None,
                 note_focus: None,
@@ -107,6 +132,10 @@ enum Dialog {
 
 struct App {
     desk: Desk,
+    server: ServerControl,
+    /// The settings the server runs with.
+    config: Config,
+    /// Shown in the empty state: the MCP URL or why the server is not running.
     status: String,
     /// Set by the desk when a new round arrives.
     attention: Arc<AtomicBool>,
@@ -114,6 +143,8 @@ struct App {
     restore_window_level: bool,
     sidebar_open: bool,
     dialog: Option<Dialog>,
+    /// The open settings dialog.
+    settings: Option<SettingsForm>,
     /// The user confirmed closing; let the next close request through.
     closing: bool,
     /// The Option card under the mouse, for the preview panel.
@@ -199,7 +230,16 @@ impl App {
         if let Some(round) = &round {
             self.shortcuts(&ctx, round);
         }
+        let settings = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
+        if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&settings)) {
+            self.open_settings();
+        }
         self.dialogs(&ctx, round.as_ref());
+        self.settings_dialog(&ctx);
+    }
+
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.settings.is_some()
     }
 
     /// On a new round: bring the window to the front and ask for attention (dock bounce,
@@ -282,6 +322,17 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 egui::global_theme_preference_buttons(ui);
+                if ui
+                    .add(
+                        egui::Button::image(button_icon(icons::SETTINGS))
+                            .image_tint_follows_text_color(true)
+                            .with_class(theme::GHOST),
+                    )
+                    .on_hover_text(format!("Settings ({}{})", cmd_symbol(), ","))
+                    .clicked()
+                {
+                    self.open_settings();
+                }
                 let Some(round) = round else { return };
                 ui.add_space(SPACE_S);
                 match round.step {
@@ -660,7 +711,7 @@ impl App {
     // ---- Keyboard -------------------------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context, round: &RoundView) {
-        if self.dialog.is_some() {
+        if self.modal_open() {
             return;
         }
         let note_focused = match round.step {
@@ -730,7 +781,7 @@ impl App {
     /// the next widget on Tab, and clear focus on Esc before `shortcuts` can tell that
     /// Esc was meant for the Note rather than for cancelling the round.
     fn take_note_keys(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.dialog.is_some() {
+        if self.modal_open() {
             return;
         }
         let Some(round) = self.desk.current() else {
@@ -828,6 +879,230 @@ impl App {
             None => {}
         }
     }
+
+    // ---- Settings -------------------------------------------------------------------------
+
+    fn open_settings(&mut self) {
+        self.settings = Some(SettingsForm::new(&self.config));
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut form) = self.settings.take() else {
+            return;
+        };
+        let mut decision = None;
+        let style = ctx.global_style();
+        let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
+        let modal = egui::Modal::new(egui::Id::unique("settings"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                let p = theme::of(ui);
+                ui.set_width(440.0);
+                ui.heading("Settings");
+                ui.add_space(SPACE_XS);
+                ui.label(
+                    RichText::new(
+                        "Where Agents reach the MCP server. Saving restarts the server; \
+                         Agents already waiting for answers stay connected.",
+                    )
+                    .color(p.muted),
+                );
+                ui.add_space(SPACE_L);
+                egui::Grid::new("settings-fields")
+                    .num_columns(2)
+                    .spacing([SPACE_M, SPACE_S])
+                    .show(ui, |ui| {
+                        ui.label("Host");
+                        ui.add(
+                            TextEdit::singleline(&mut form.host)
+                                .hint_text(DEFAULT_HOST)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                        ui.label("Port");
+                        ui.add(
+                            TextEdit::singleline(&mut form.port)
+                                .hint_text(DEFAULT_PORT.to_string())
+                                .desired_width(96.0),
+                        );
+                        ui.end_row();
+                        ui.label("Access token");
+                        ui.add(
+                            TextEdit::singleline(&mut form.token)
+                                .password(!form.show_token)
+                                .hint_text("None: every local client may connect")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut form.show_token, "Show token");
+                        ui.end_row();
+                    });
+                let mut warnings = Vec::new();
+                if !is_loopback(&form.host) {
+                    let mut warning = "Other machines can reach this address.".to_owned();
+                    if form.token.trim().is_empty() {
+                        warning.push_str(" Set an access token.");
+                    }
+                    warnings.push(warning);
+                }
+                warnings.extend(form.error.clone());
+                for warning in warnings {
+                    ui.add_space(SPACE_S);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add(icon(icons::WARN, 16.0, p.warn));
+                        ui.label(RichText::new(warning).color(p.warn));
+                    });
+                }
+                ui.add_space(SPACE_L);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("Save").with_class(theme::PRIMARY))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+                if let Some(path) = config::path() {
+                    ui.add_space(SPACE_S);
+                    ui.label(
+                        RichText::new(format!("Saved in {}", home_relative(&path)))
+                            .size(theme::TEXT_SMALL)
+                            .color(p.muted),
+                    );
+                }
+                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                    decision = Some(true);
+                }
+            });
+        if modal.should_close() && decision.is_none() {
+            decision = Some(false);
+        }
+        let close = match decision {
+            Some(true) => self.save_settings(&mut form),
+            Some(false) => true,
+            None => false,
+        };
+        if !close {
+            self.settings = Some(form);
+        }
+    }
+
+    /// Restarts the server with the form's settings and writes them to the config file.
+    /// Returns whether the dialog may close; otherwise `form.error` says why not.
+    fn save_settings(&mut self, form: &mut SettingsForm) -> bool {
+        let config = match form.config() {
+            Ok(config) => config,
+            Err(e) => {
+                form.error = Some(e);
+                return false;
+            }
+        };
+        if config != self.config || !self.server.is_running() {
+            let result = self.server.restart(config.server_settings());
+            if let Err(e) = result {
+                form.error = Some(e.clone());
+                if !self.server.is_running() {
+                    self.status = server_status(Err(e));
+                }
+                return false;
+            }
+            self.status = server_status(result);
+            self.config = config.clone();
+        }
+        match config::save(&config) {
+            Ok(path) => {
+                log::info!("saved settings to {}", path.display());
+                true
+            }
+            Err(e) => {
+                form.error = Some(format!(
+                    "The server runs with these settings, but saving failed: {e}"
+                ));
+                false
+            }
+        }
+    }
+}
+
+/// The settings dialog's fields, as typed.
+struct SettingsForm {
+    host: String,
+    port: String,
+    token: String,
+    show_token: bool,
+    /// Why the last save failed.
+    error: Option<String>,
+}
+
+impl SettingsForm {
+    fn new(config: &Config) -> Self {
+        Self {
+            host: config.host.clone(),
+            port: config.port.to_string(),
+            token: config.bearer_token.clone().unwrap_or_default(),
+            show_token: false,
+            error: None,
+        }
+    }
+
+    /// The config the fields describe, or what is wrong with them.
+    fn config(&self) -> Result<Config, String> {
+        let port = self
+            .port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p != 0)
+            .ok_or("The port must be a number between 1 and 65535.")?;
+        let token = self.token.trim();
+        let config = Config {
+            host: self.host.trim().to_owned(),
+            port,
+            bearer_token: (!token.is_empty()).then(|| token.to_owned()),
+        };
+        config::validate(&config)?;
+        Ok(config)
+    }
+}
+
+/// The empty state's line for the outcome of starting the server.
+fn server_status(started: Result<String, String>) -> String {
+    match started {
+        Ok(url) => {
+            log::info!("listening on {url}");
+            format!("Agents connect to {url}")
+        }
+        Err(e) => {
+            log::error!("{e}");
+            format!("The MCP server did not start: {e}")
+        }
+    }
+}
+
+/// Whether `host` is reachable from this machine only.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `path` with the home directory shown as `~`.
+fn home_relative(path: &std::path::Path) -> String {
+    directories::BaseDirs::new()
+        .and_then(|d| {
+            path.strip_prefix(d.home_dir())
+                .ok()
+                .map(|p| format!("~/{}", p.display()))
+        })
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// The page content: centered and at most `PAGE_WIDTH` wide, so long lines stay readable.

@@ -1,34 +1,56 @@
-//! The user's settings: `config.toml` in the platform's config directory.
+//! The user's settings: `config.toml` in `~/.config/question-desk/` (Windows: `%APPDATA%`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::server::DEFAULT_PORT;
+use crate::server::{DEFAULT_HOST, DEFAULT_PORT, ServerSettings};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Port on `127.0.0.1` the MCP server listens on.
+    /// Address or name the MCP server listens on.
+    pub host: String,
+    /// Port the MCP server listens on.
     pub port: u16,
     /// If set, clients must send `Authorization: Bearer <token>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
             bearer_token: None,
         }
     }
 }
 
-/// `…/question-desk/config.toml` in the platform's config directory, e.g.
-/// `~/Library/Application Support/question-desk/config.toml` on macOS.
+impl Config {
+    pub fn server_settings(&self) -> ServerSettings {
+        ServerSettings {
+            host: self.host.clone(),
+            port: self.port,
+            bearer_token: self.bearer_token.clone(),
+            ..ServerSettings::default()
+        }
+    }
+}
+
+/// `~/.config/question-desk/config.toml` on macOS and Linux (under `$XDG_CONFIG_HOME` if
+/// set), `%APPDATA%\question-desk\config\config.toml` on Windows.
 pub fn path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "question-desk")
-        .map(|d| d.config_dir().join("config.toml"))
+    if cfg!(windows) {
+        return directories::ProjectDirs::from("", "", "question-desk")
+            .map(|d| d.config_dir().join("config.toml"));
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".config")))?;
+    Some(base.join("question-desk").join("config.toml"))
 }
 
 /// Loads the config file; defaults when it does not exist.
@@ -43,14 +65,48 @@ pub fn load() -> Result<Config, String> {
     }
 }
 
+/// Writes `config` to [`path`]; only the owner may read it, as it may hold the token.
+pub fn save(config: &Config) -> Result<PathBuf, String> {
+    let path = path().ok_or("no home directory to save the settings in")?;
+    write(&path, config).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn write(path: &Path, config: &Config) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = toml::to_string(config).expect("config serializes");
+    let temp = path.with_extension("toml.tmp");
+    std::fs::write(&temp, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&temp, path)
+}
+
 pub fn parse(text: &str) -> Result<Config, String> {
     let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
-    if config
-        .bearer_token
-        .as_deref()
-        .is_some_and(|t| t.trim().is_empty())
-    {
-        return Err("`bearer_token` must not be empty; remove it to disable the token".into());
-    }
+    validate(&config)?;
     Ok(config)
+}
+
+pub fn validate(config: &Config) -> Result<(), String> {
+    if config.host.trim().is_empty() {
+        return Err("`host` must not be empty".into());
+    }
+    if config.port == 0 {
+        return Err("`port` must be between 1 and 65535".into());
+    }
+    if let Some(token) = &config.bearer_token {
+        if token.trim().is_empty() {
+            return Err("`bearer_token` must not be empty; remove it to disable the token".into());
+        }
+        if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err("`bearer_token` must not contain spaces or control characters".into());
+        }
+    }
+    Ok(())
 }

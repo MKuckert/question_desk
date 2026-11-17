@@ -2,7 +2,7 @@
 
 A desktop app that replaces Claude Code's built-in `AskUserQuestion` with a large, focused window. Agents call `ask_user_question` over MCP with the same fields they already know, without the limits: any number of Questions, any number of Options (or none), a Markdown `body` and a Recommendation per Question. You answer one Question at a time, review, and Submit; the Agent gets the familiar `Your questions have been answered: "Q"="A". …` result.
 
-You start the app yourself, outside any sandbox. It hosts a Streamable HTTP MCP server on `127.0.0.1`, so sandboxed Agents only need localhost network access. Several Agents can wait at the same time; the sidebar lets you answer their rounds in any order.
+You start the app yourself, outside any sandbox. It hosts a Streamable HTTP MCP server on `127.0.0.1` (by default), so sandboxed Agents only need localhost network access. Several Agents can wait at the same time; the sidebar lets you answer their rounds in any order.
 
 Terms used here are defined in [GLOSSARY.md](GLOSSARY.md); design decisions are in [docs/adr/](docs/adr/).
 
@@ -16,18 +16,20 @@ The window shows the MCP URL while no questions are open (default `http://127.0.
 
 ## Configure
 
-Optional settings live in `config.toml` in the platform's config directory:
+Open **Settings** with the gear in the top bar (or `⌘,` / `Ctrl+,`) to set the host, port and access token. Saving restarts the MCP server right away; Agents already waiting for answers stay connected, new calls need the new URL and token.
 
-- macOS: `~/Library/Application Support/question-desk/config.toml`
-- Linux: `~/.config/question-desk/config.toml`
+The settings live in `config.toml`:
+
+- macOS and Linux: `~/.config/question-desk/config.toml` (`$XDG_CONFIG_HOME/question-desk/` if set)
 - Windows: `%APPDATA%\question-desk\config\config.toml`
 
 ```toml
-port = 7457                      # listens on 127.0.0.1 only
+host = "127.0.0.1"                      # default; other addresses expose the port to your network
+port = 7457
 bearer_token = "a-long-random-string"   # optional; clients must send it
 ```
 
-With `bearer_token` set, requests without `Authorization: Bearer <token>` get `401`. Requests carrying an `Origin` header always get `403`, so web pages cannot reach the port.
+With `bearer_token` set, requests without `Authorization: Bearer <token>` get `401`. Requests carrying an `Origin` header always get `403`, so web pages cannot reach the port. If you listen on anything other than localhost, set a token.
 
 ## Connect Claude Code
 

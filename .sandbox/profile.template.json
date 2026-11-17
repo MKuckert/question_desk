@@ -4,13 +4,13 @@
   "groups": { "include": ["rust_runtime"] },
   "meta": {
     "name": "ask_user_question_ui",
-    "version": "7"
+    "version": "11"
   },
   "workdir": {
     "access": "readwrite"
   },
   "filesystem": {
-    "allow": ["~/.cargo/", "~/Library/Application Support/question-desk"],
+    "allow": ["~/.cargo/", "~/Library/Application Support/question-desk", "~/.agents/skills/", "~/.config/question-desk"],
     "deny": ["~/.gitconfig"],
     "read_file": [
       "~/.gitconfig-private",

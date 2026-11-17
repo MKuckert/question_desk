@@ -18,6 +18,7 @@ pub const LOGO: ImageSource<'static> =
 pub const SPARKLES: ImageSource<'static> = include_image!("../../assets/icons/sparkles.svg");
 pub const EYE: ImageSource<'static> = include_image!("../../assets/icons/eye.svg");
 pub const DONE: ImageSource<'static> = include_image!("../../assets/icons/circle-check-big.svg");
+pub const SETTINGS: ImageSource<'static> = include_image!("../../assets/icons/settings.svg");
 
 /// An icon at `size` points, tinted `color`.
 pub fn icon(source: ImageSource<'static>, size: f32, color: Color32) -> egui::Image<'static> {
