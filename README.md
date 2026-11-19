@@ -76,6 +76,10 @@ With `bearer_token` set, requests without `Authorization: Bearer <token>` get `4
 
 Run only the Agent in the sandbox. Its profile needs network access to `127.0.0.1:7457`; the Question Desk runs outside.
 
+### Grilling skill
+
+[`.claude/skills/grill-with-desk`](.claude/skills/grill-with-desk/SKILL.md) is a variant of Matt Pocock's [`grilling`](https://github.com/mattpocock/skills) skill that asks each round of the interview as one Question Round in the desk: every open decision becomes a Question with its trade-offs in the `body` and a Recommendation, and your Notes feed into the next round. It is active in this repo; copy the folder to `~/.claude/skills/` to use it everywhere. Invoke it with `/grill-with-desk`, or ask Claude to grill you with the Question Desk.
+
 ## The tools
 
 **`ask_user_question`** takes the AskUserQuestion fields plus a few more:
