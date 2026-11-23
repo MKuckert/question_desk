@@ -25,9 +25,10 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use crate::{
     config::{self, Config},
     desk::{
-        Desk, DeskEvent, OptionView, QuestionState, QuestionView, RedeliveryView, RoundSummary,
-        RoundView, SessionView, Step,
+        Desk, DeskEvent, FinishedView, HistoryEntry, OptionView, QuestionState, QuestionView,
+        RedeliveryView, RoundSummary, RoundView, SessionView, Step,
     },
+    format::Outcome,
     server::{DEFAULT_HOST, DEFAULT_PORT, ServerControl},
 };
 use grapheme::GraphemeText;
@@ -35,6 +36,8 @@ use icons::{button_icon, icon};
 use theme::{SPACE_L, SPACE_M, SPACE_S, SPACE_XS};
 
 const ZOOM_KEY: &str = "zoom_factor";
+/// Expands and collapses the History section.
+const HISTORY_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
 /// Below this width of the page the preview panel moves under the Options.
 const WIDE_LAYOUT: f32 = 720.0;
 /// The widest the page content gets.
@@ -98,6 +101,7 @@ pub fn run(
                 attention,
                 restore_window_level: false,
                 sidebar_open: true,
+                history_open: false,
                 dialog: None,
                 settings: None,
                 closing: false,
@@ -143,6 +147,8 @@ struct App {
     /// The window was raised above others last frame and must go back to normal.
     restore_window_level: bool,
     sidebar_open: bool,
+    /// The History section is expanded; collapsed, only its header shows at the bottom.
+    history_open: bool,
     dialog: Option<Dialog>,
     /// The open settings dialog.
     settings: Option<SettingsForm>,
@@ -189,7 +195,10 @@ impl App {
 
         let sessions = self.desk.sessions();
         let redeliveries = self.desk.redeliveries();
+        let history = self.desk.history();
         let round = self.desk.current();
+        // Only an open round takes answers; a finished one is shown read-only.
+        let open_round = round.as_ref().filter(|r| r.finished.is_none());
 
         let p = theme::of(ui);
         let bar = Frame::new()
@@ -198,7 +207,7 @@ impl App {
         egui::Panel::top("top")
             .frame(bar)
             .show(ui, |ui| self.top_bar(ui, round.as_ref()));
-        if let Some(round) = &round {
+        if let Some(round) = open_round {
             egui::Panel::bottom("footer")
                 .frame(bar.inner_margin(Margin::symmetric(SPACE_L as i8, SPACE_M as i8)))
                 .show(ui, |ui| self.footer(ui, round));
@@ -210,7 +219,7 @@ impl App {
             .min_size(200.0)
             .frame(Frame::new().fill(p.panel).inner_margin(SPACE_M))
             .show_collapsible(ui, &mut sidebar_open, |ui| {
-                self.sidebar(ui, &sessions, &redeliveries, round.as_ref())
+                self.sidebar(ui, &sessions, &redeliveries, &history, round.as_ref())
             });
         self.sidebar_open = sidebar_open;
         egui::CentralPanel::default()
@@ -222,19 +231,23 @@ impl App {
             .show(ui, |ui| {
                 page_column(ui, |ui| match &round {
                     None => self.empty_state(ui),
-                    Some(round) => match round.step {
-                        Step::Question(i) => self.question_page(ui, round, i),
-                        Step::Review => self.review_page(ui, round),
+                    Some(round) => match (&round.finished, round.step) {
+                        (Some(finished), _) => self.finished_page(ui, round, finished),
+                        (None, Step::Question(i)) => self.question_page(ui, round, i),
+                        (None, Step::Review) => self.review_page(ui, round),
                     },
                 })
             });
 
-        if let Some(round) = &round {
+        if let Some(round) = open_round {
             self.shortcuts(&ctx, round);
         }
         let settings = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
         if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&settings)) {
             self.open_settings();
+        }
+        if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&HISTORY_SHORTCUT)) {
+            self.toggle_history();
         }
         self.dialogs(&ctx, round.as_ref());
         self.settings_dialog(&ctx);
@@ -317,12 +330,16 @@ impl App {
                             .color(p.text),
                     );
                 }
-                ui.label(
-                    RichText::new(format!("opened {}", time::clock(round.opened_at)))
-                        .size(theme::TEXT_SMALL)
-                        .color(p.muted),
-                );
-                if !round.connected {
+                let mut times = format!("opened {}", time::clock(round.opened_at));
+                if let Some(finished) = &round.finished {
+                    times += &format!(
+                        " · {} {}",
+                        outcome_verb(finished.outcome),
+                        time::clock(finished.finished_at)
+                    );
+                }
+                ui.label(RichText::new(times).size(theme::TEXT_SMALL).color(p.muted));
+                if !round.connected && round.finished.is_none() {
                     ui.add(icon(icons::WARN, 16.0, p.warn));
                     ui.label(RichText::new("Agent disconnected").color(p.warn))
                         .on_hover_text(
@@ -346,6 +363,10 @@ impl App {
                 }
                 let Some(round) = round else { return };
                 ui.add_space(SPACE_S);
+                if let Some(finished) = &round.finished {
+                    theme::neutral_chip(ui, outcome_label(finished.outcome));
+                    return;
+                }
                 match round.step {
                     Step::Question(i) => {
                         ui.label(
@@ -366,6 +387,7 @@ impl App {
         ui: &mut egui::Ui,
         sessions: &[SessionView],
         redeliveries: &[RedeliveryView],
+        history: &[HistoryEntry],
         current: Option<&RoundView>,
     ) {
         let p = theme::of(ui);
@@ -382,38 +404,112 @@ impl App {
             }
         });
         ui.add_space(SPACE_XS);
-        ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = SPACE_XS;
-            if sessions.is_empty() && redeliveries.is_empty() {
-                ui.label(RichText::new("Nothing waiting").color(p.muted));
-            }
-            for request in redeliveries {
-                self.redelivery_banner(ui, request);
-            }
-            for session in sessions {
-                ui.add_space(SPACE_S);
-                ui.label(
-                    RichText::new(&session.label)
-                        .size(theme::TEXT_SMALL)
-                        .color(p.muted),
-                );
-                for round in &session.rounds {
-                    let selected = current.is_some_and(|c| c.ticket == round.ticket);
-                    let text = round_entry(ui, round, selected);
-                    let mut button = egui::Button::new(text);
-                    if round.new {
-                        button = button.right_text(new_badge(ui));
+        // Collapsed, the History header sits at the bottom; expanded, it takes the lower half.
+        let history_header = 36.0;
+        let open_height = if self.history_open {
+            ui.available_height() * 0.5
+        } else {
+            ui.available_height() - history_header
+        };
+        ScrollArea::vertical()
+            .id_salt("open-rounds")
+            .auto_shrink([false, false])
+            .max_height(open_height.max(0.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = SPACE_XS;
+                if sessions.is_empty() && redeliveries.is_empty() {
+                    ui.label(RichText::new("Nothing waiting").color(p.muted));
+                }
+                for request in redeliveries {
+                    self.redelivery_banner(ui, request);
+                }
+                for session in sessions {
+                    ui.add_space(SPACE_S);
+                    ui.label(
+                        RichText::new(&session.label)
+                            .size(theme::TEXT_SMALL)
+                            .color(p.muted),
+                    );
+                    for round in &session.rounds {
+                        let selected = current.is_some_and(|c| c.id == round.id);
+                        let text = round_entry(ui, round, selected);
+                        let mut button = egui::Button::new(text);
+                        if round.new {
+                            button = button.right_text(new_badge(ui));
+                        }
+                        let button = button
+                            .selected(selected)
+                            .with_class(theme::NAV)
+                            .min_size(egui::vec2(ui.available_width(), 0.0));
+                        if ui.add(button).clicked() {
+                            self.desk.select(&round.id);
+                        }
+                    }
+                }
+            });
+        self.history_section(ui, history, current);
+    }
+
+    fn toggle_history(&mut self) {
+        self.history_open = !self.history_open;
+    }
+
+    /// The History header, and the finished rounds below it when expanded.
+    fn history_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        history: &[HistoryEntry],
+        current: Option<&RoundView>,
+    ) {
+        let p = theme::of(ui);
+        ui.separator();
+        let arrow = if self.history_open { "▾" } else { "▸" };
+        let header = egui::Button::new(
+            RichText::new(format!("{arrow}  HISTORY"))
+                .font(theme::semibold(theme::TEXT_SMALL))
+                .color(p.muted),
+        )
+        .right_text(RichText::new(history.len().to_string()).color(p.muted))
+        .with_class(theme::NAV)
+        .min_size(egui::vec2(ui.available_width(), 0.0));
+        let tip = format!(
+            "{} History ({}Y)",
+            if self.history_open {
+                "Collapse"
+            } else {
+                "Expand"
+            },
+            cmd_symbol()
+        );
+        if ui.add(header).on_hover_text(tip).clicked() {
+            self.toggle_history();
+        }
+        if !self.history_open {
+            return;
+        }
+        ScrollArea::vertical()
+            .id_salt("history")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = SPACE_XS;
+                if history.is_empty() {
+                    ui.label(RichText::new("No finished rounds yet").color(p.muted));
+                }
+                for entry in history {
+                    let selected = current.is_some_and(|c| c.id == entry.id);
+                    let mut button = egui::Button::new(history_entry(ui, entry, selected));
+                    if entry.awaiting_pickup {
+                        button = button.right_text(badge(ui, "Awaiting Pickup", p.warn));
                     }
                     let button = button
                         .selected(selected)
                         .with_class(theme::NAV)
                         .min_size(egui::vec2(ui.available_width(), 0.0));
                     if ui.add(button).clicked() {
-                        self.desk.select(&round.ticket);
+                        self.desk.select(&entry.id);
                     }
                 }
-            }
-        });
+            });
     }
 
     /// A Re-delivery Request: who wants which Delivered result again, and the decision.
@@ -676,6 +772,128 @@ impl App {
         }
     }
 
+    // ---- Finished round -------------------------------------------------------------------
+
+    /// A finished round, read-only: every Question with all its Options, the chosen ones
+    /// marked, and the Notes.
+    fn finished_page(&mut self, ui: &mut egui::Ui, round: &RoundView, finished: &FinishedView) {
+        let p = theme::of(ui);
+        ui.horizontal_wrapped(|ui| {
+            let (mark, color) = match finished.outcome {
+                Outcome::Submitted => (icons::DONE, p.success),
+                Outcome::Cancelled => (icons::CLOSE, p.muted),
+            };
+            ui.add(icon(mark, 18.0, color));
+            ui.heading(format!(
+                "{} {}",
+                outcome_label(finished.outcome),
+                time::when(finished.finished_at)
+            ));
+        });
+        ui.add_space(SPACE_XS);
+        ui.horizontal_wrapped(|ui| match finished.delivered_at {
+            Some(delivered) => {
+                ui.label(
+                    RichText::new(format!("Delivered to the Agent {}.", time::when(delivered)))
+                        .color(p.muted),
+                );
+            }
+            None => {
+                theme::chip(ui, "Awaiting Pickup", p.on_accent, p.warn);
+                ui.label(RichText::new("No Agent has received these answers yet.").color(p.muted));
+                if finished.can_reopen
+                    && ui
+                        .add(egui::Button::new("Reopen and change answers"))
+                        .clicked()
+                {
+                    self.desk.reopen();
+                }
+            }
+        });
+        ui.add_space(SPACE_L);
+        ScrollArea::vertical()
+            .id_salt(("finished", &round.id))
+            .show(ui, |ui| {
+                for (i, question) in round.questions.iter().enumerate() {
+                    card_frame(p.surface, Stroke::new(1.0, p.border)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.finished_question(ui, round, question, i);
+                    });
+                    ui.add_space(SPACE_S);
+                }
+            });
+    }
+
+    fn finished_question(
+        &mut self,
+        ui: &mut egui::Ui,
+        round: &RoundView,
+        question: &QuestionView,
+        index: usize,
+    ) {
+        let p = theme::of(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{}.", index + 1)).color(p.muted));
+            theme::neutral_chip(ui, &question.header);
+            ui.label(
+                RichText::new(&question.question)
+                    .font(theme::semibold(theme::TEXT_BODY))
+                    .color(p.text_strong),
+            );
+        });
+        if let Some(body) = &question.body {
+            ui.add_space(SPACE_XS);
+            ui.push_id(("finished-body", &round.id, index), |ui| {
+                CommonMarkViewer::new().show(ui, &mut self.markdown, body);
+            });
+        }
+        ui.add_space(SPACE_S);
+        for option in &question.options {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SPACE_S;
+                selection_mark(ui, question.multi_select, option.selected);
+                let color = if option.selected {
+                    p.text_strong
+                } else {
+                    p.text
+                };
+                ui.label(
+                    RichText::new(&option.label)
+                        .font(theme::semibold(theme::TEXT_BODY))
+                        .color(color),
+                );
+                if option.recommended {
+                    theme::accent_chip(ui, "Recommended");
+                }
+                if !option.description.is_empty() {
+                    ui.label(RichText::new(&option.description).color(p.muted));
+                }
+            });
+        }
+        if question.options.is_empty()
+            || question.answer.is_none()
+            || question.answer_note.is_some()
+        {
+            ui.add_space(SPACE_XS);
+        }
+        match (
+            &question.answer,
+            question.options.iter().any(|o| o.selected),
+        ) {
+            (None, _) => {
+                ui.label(RichText::new("Unanswered").italics().color(p.warn));
+            }
+            // Without a selection, the Note is the Answer.
+            (Some(answer), false) => {
+                ui.label(RichText::new(format!("Answer: {answer}")).color(p.text));
+            }
+            (Some(_), true) => {}
+        }
+        if let Some(note) = &question.answer_note {
+            ui.label(RichText::new(format!("Note: {note}")).color(p.muted));
+        }
+    }
+
     // ---- Review page ----------------------------------------------------------------------
 
     fn review_page(&mut self, ui: &mut egui::Ui, round: &RoundView) {
@@ -832,7 +1050,7 @@ impl App {
         if self.modal_open() {
             return;
         }
-        let Some(round) = self.desk.current() else {
+        let Some(round) = self.desk.current().filter(|r| r.finished.is_none()) else {
             return;
         };
         let Step::Question(index) = round.step else {
@@ -1359,18 +1577,64 @@ fn round_entry(ui: &egui::Ui, round: &RoundSummary, selected: bool) -> egui::tex
 
 /// The "New" badge of a round the user has not looked at, laid out inside its sidebar entry.
 fn new_badge(ui: &egui::Ui) -> egui::Atom<'static> {
+    badge(ui, "New", theme::of(ui).accent)
+}
+
+/// A filled badge with `text`, laid out inside a sidebar entry.
+fn badge(ui: &egui::Ui, text: &str, fill: Color32) -> egui::Atom<'static> {
     let p = theme::of(ui);
     let galley = ui.painter().layout_no_wrap(
-        "New".to_owned(),
+        text.to_owned(),
         theme::semibold(theme::TEXT_SMALL),
         p.on_accent,
     );
     let padding = egui::vec2(SPACE_S, 2.0);
     egui::Atom::paint(galley.size() + 2.0 * padding, move |ui, args| {
         let painter = ui.painter();
-        painter.rect_filled(args.rect, theme::RADIUS, p.accent);
+        painter.rect_filled(args.rect, theme::RADIUS, fill);
         painter.galley(args.rect.min + padding, galley.clone(), p.on_accent);
     })
+}
+
+/// A History entry: title, Agent Session, and when the round finished.
+fn history_entry(ui: &egui::Ui, entry: &HistoryEntry, selected: bool) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let p = theme::of(ui);
+    let mut job = LayoutJob::default();
+    let title_color = if selected { p.text_strong } else { p.text };
+    job.append(
+        entry.title.as_deref().unwrap_or(&entry.ticket),
+        0.0,
+        TextFormat::simple(theme::semibold(theme::TEXT_BUTTON), title_color),
+    );
+    job.append(
+        &format!(
+            "\n{}\n{} {} · {}/{} answered",
+            entry.session,
+            outcome_verb(entry.outcome),
+            time::clock(entry.finished_at),
+            entry.answered,
+            entry.total
+        ),
+        0.0,
+        TextFormat::simple(FontId::proportional(theme::TEXT_SMALL), p.muted),
+    );
+    job
+}
+
+/// "answered" or "cancelled", as in "answered 14:50".
+fn outcome_verb(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Submitted => "answered",
+        Outcome::Cancelled => "cancelled",
+    }
+}
+
+fn outcome_label(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Submitted => "Answered",
+        Outcome::Cancelled => "Cancelled",
+    }
 }
 
 fn note_id(ticket: &str, index: usize) -> egui::Id {

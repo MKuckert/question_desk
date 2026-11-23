@@ -18,3 +18,8 @@ Spec: `../spec.md` (stories 7–11) · ADR 0007
 - [ ] Read-model tests: History ordering, badge state, reopen allowed only when undelivered.
 - [ ] Headless test: reopen, then `wait_for_answers` → pending until re-submit, then the new answers.
 - [ ] Collapsed and expanded states checked via `tools/screenshot.sh`.
+
+## Comments
+
+- Implemented on branch `persistence`. History is collapsed by default; clicking its header or pressing ⌘Y (Ctrl+Y) toggles it. Reopening puts the round on its Review Page.
+- The collapsed/expanded screenshot check could not run here: window capture is not permitted in this environment.

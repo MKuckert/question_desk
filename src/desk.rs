@@ -118,6 +118,35 @@ pub struct RoundView {
     pub questions: Vec<QuestionView>,
     pub connected: bool,
     pub opened_at: SystemTime,
+    /// Set once the round is finished; it is read-only then.
+    pub finished: Option<FinishedView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedView {
+    pub outcome: Outcome,
+    pub finished_at: SystemTime,
+    /// `None` while Awaiting Pickup.
+    pub delivered_at: Option<SystemTime>,
+    /// Awaiting Pickup rounds can be reopened and changed; Delivered ones cannot.
+    pub can_reopen: bool,
+}
+
+/// A finished round in the History.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub id: String,
+    pub ticket: String,
+    pub title: Option<String>,
+    /// The Agent Session label.
+    pub session: String,
+    pub outcome: Outcome,
+    pub opened_at: SystemTime,
+    pub finished_at: SystemTime,
+    /// No Agent has received the result yet.
+    pub awaiting_pickup: bool,
+    pub answered: usize,
+    pub total: usize,
 }
 
 impl RoundView {
@@ -478,10 +507,35 @@ impl Desk {
         sessions
     }
 
-    /// The selected round, if any.
+    /// Finished rounds, most recently finished first.
+    pub fn history(&self) -> Vec<HistoryEntry> {
+        let state = self.lock();
+        let mut history: Vec<HistoryEntry> = state
+            .rounds
+            .iter()
+            .filter_map(|round| {
+                Some(HistoryEntry {
+                    id: round.id.clone(),
+                    ticket: round.ticket.clone(),
+                    title: round.title.clone(),
+                    session: round.session.clone(),
+                    outcome: round.outcome()?,
+                    opened_at: round.opened_at,
+                    finished_at: round.finished_at.unwrap_or(round.opened_at),
+                    awaiting_pickup: round.delivered_at.is_none(),
+                    answered: round.answered_count(),
+                    total: round.questions.len(),
+                })
+            })
+            .collect();
+        history.sort_by_key(|e| std::cmp::Reverse(e.finished_at));
+        history
+    }
+
+    /// The selected round, open or finished, if any.
     pub fn current(&self) -> Option<RoundView> {
         let state = self.lock();
-        let round = state.selected_round()?;
+        let round = &state.rounds[state.selected_any()?];
         let questions = round
             .questions
             .iter()
@@ -538,13 +592,19 @@ impl Desk {
             questions,
             connected: round.connected(),
             opened_at: round.opened_at,
+            finished: round.outcome().map(|outcome| FinishedView {
+                outcome,
+                finished_at: round.finished_at.unwrap_or(round.opened_at),
+                delivered_at: round.delivered_at,
+                can_reopen: round.delivered_at.is_none(),
+            }),
         })
     }
 
     /// Selects the round with this id (see [`RoundSummary::id`]).
     pub fn select(&self, id: &str) {
         let mut state = self.lock();
-        if let Some(round) = state.rounds.iter_mut().find(|r| r.id == id && r.is_open()) {
+        if let Some(round) = state.rounds.iter_mut().find(|r| r.id == id) {
             round.seen = true;
             state.selected = Some(id.to_owned());
         }
@@ -628,6 +688,25 @@ impl Desk {
         self.with_selected(|round| round.step = Step::Review);
     }
 
+    /// Makes the selected Awaiting Pickup round open again, on its Review Page; a Pickup
+    /// then waits for the re-submit. Delivered rounds stay as they are.
+    pub fn reopen(&self) {
+        let mut state = self.lock();
+        let Some(i) = state.selected_any() else {
+            return;
+        };
+        let round = &mut state.rounds[i];
+        if round.is_open() || round.delivered_at.is_some() {
+            return;
+        }
+        round.result.send_replace(None);
+        round.finished_at = None;
+        round.step = Step::Review;
+        state.save(i);
+        drop(state);
+        self.notify(DeskEvent::Changed);
+    }
+
     pub fn submit(&self) {
         self.finish(Outcome::Submitted);
     }
@@ -686,6 +765,13 @@ impl State {
         });
     }
 
+    /// The selected round, open or finished.
+    fn selected_any(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.rounds.iter().position(|r| &r.id == selected)
+    }
+
+    /// The selected round if it is open: only open rounds take user input.
     fn selected_index(&self) -> Option<usize> {
         let selected = self.selected.as_ref()?;
         self.rounds
