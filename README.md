@@ -6,6 +6,19 @@ You start the app yourself, outside any sandbox. It hosts a Streamable HTTP MCP 
 
 Terms used here are defined in [GLOSSARY.md](GLOSSARY.md); design decisions are in [docs/adr/](docs/adr/).
 
+![The Question Desk showing a round with Option cards, a Recommended badge and a preview panel, while rounds from four projects wait in the sidebar](docs/screenshot.png)
+
+## Why it's nice
+
+The built-in `AskUserQuestion` is a cramped terminal widget: four Questions, four Options, no room to explain a trade-off. The Question Desk gives the conversation the space it deserves:
+
+- **Room to think.** Every Question can carry a Markdown `body` with context, tables and code, Options can show a `preview`, and the Agent's Recommendation is badged but never pre-selected, so you still decide.
+- **Keyboard first.** `1`–`9` picks, `Enter` accepts the Recommendation, `⌘↩` moves on. A ten-Question grilling round takes a minute, not ten.
+- **Many Agents, one desk.** Rounds from different Agents and projects line up in the sidebar; answer them in any order while the Agents wait.
+- **Nothing gets lost.** Heartbeats keep long calls alive, and if a call drops anyway, the Ticket lets the Agent pick up your answers later.
+- **Drop-in.** Same fields Agents already know, same result format they already parse. Disable the built-in tool and your Agents switch over without a prompt change.
+- **Small and local.** One native Rust binary (egui, color emoji included), an MCP server on localhost, optional bearer token, and no web page can reach the port.
+
 ## Run
 
 ```sh
