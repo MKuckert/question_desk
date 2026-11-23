@@ -1,6 +1,6 @@
 # 3. Blocking call with Heartbeat, plus Ticket-based Pickup as fallback
 
-Status: accepted (2026-11-12), revised after spike 2 (2026-11-13)
+Status: accepted (2026-11-12), revised after spike 2 (2026-11-13); consequences on persistence and Ticket lifetime revised by ADR 0007
 
 ## Context
 

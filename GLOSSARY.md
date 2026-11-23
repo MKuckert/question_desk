@@ -27,8 +27,18 @@ _Avoid_: form, batch, request.
 
 **Cancel** — the user abandons a Question Round (after confirmation); the partial Answers are delivered with status `cancelled`.
 
-**Ticket** — the identifier of a Question Round, chosen by the Agent in the `ask_user_question` call so it can Pick Up the result later even if the call is dropped.
+**Ticket** — the identifier of a Question Round, chosen by the Agent in the `ask_user_question` call so it can Pick Up the result later even if the call is dropped. A Ticket is held by its round until the round is Delivered; after that, the same Ticket with different Questions opens a new round.
 
-**Pickup** — retrieving a Question Round's result after the original blocking call was lost (timeout, disconnect), via `wait_for_answers(ticket)` or by repeating the `ask_user_question` call with the same Ticket.
+**Pickup** — retrieving a Question Round's result after the original blocking call was lost (timeout, disconnect, app restart), via `wait_for_answers(ticket)` or by repeating the `ask_user_question` call with the same Ticket. A Pickup of a Delivered round raises a Re-delivery Request instead.
+
+**Delivered** — a finished Question Round whose result was written to an HTTP response for an Agent. Delivery releases the Ticket. Whether the Agent actually read the result is unknowable.
+
+**Awaiting Pickup** — a finished Question Round that has not been Delivered yet (e.g. submitted while no call was attached). Badged in the UI; can be reopened and changed.
+
+**Re-delivery Request** — an Agent asking for the result of a Delivered round again (same Questions, or `wait_for_answers`). Shown on the round as a banner; the user chooses Deliver again or Decline.
+_Avoid_: retry, resend.
+
+**History** — the persisted finished Question Rounds, listed flat and newest first below the open rounds; searchable, exportable per round, deletable.
+_Avoid_: archive, log.
 
 **Heartbeat** — the MCP progress notification the server sends periodically while a blocking call waits for the user, to keep client idle timeouts from firing.
