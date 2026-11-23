@@ -108,12 +108,7 @@ async fn the_agent_picks_up_a_result_submitted_before_the_restart() {
     h.select("db-1").await;
     ask.abort();
     // The call is gone before the user submits: the result is Awaiting Pickup.
-    for _ in 0..200 {
-        if !h.appeared("db-1").await.connected {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    h.disconnected("db-1").await;
     h.desk.toggle_option(1);
     h.desk.submit();
     quit(h);

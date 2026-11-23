@@ -8,7 +8,7 @@ use question_desk::desk::{Desk, QuestionState, Step};
 use question_desk::server::ServerSettings;
 use rmcp::{
     RoleClient,
-    model::{Implementation, ProtocolVersion},
+    model::ProtocolVersion,
     service::{ClientLifecycleMode, ClientServiceExt, RunningService},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -190,9 +190,6 @@ async fn repeating_the_call_with_the_same_ticket_reattaches_instead_of_asking_tw
     let (first, second) = (first.await.unwrap(), second.await.unwrap());
     assert_eq!(first, second);
     assert!(text(&first).contains(r#""Which database?"="Postgres""#));
-
-    let late = call(&h.agent().await, "ask_user_question", db_round("db-3")).await;
-    assert_eq!(late, first, "a finished round's result is delivered again");
 }
 
 #[tokio::test]
@@ -294,7 +291,7 @@ async fn an_unknown_ticket_is_a_tool_error() {
     assert_eq!(result.is_error, Some(true));
     assert_eq!(
         text(&result),
-        "unknown ticket \"nope\": no question round was asked with it since the Question Desk started"
+        "unknown ticket \"nope\": the Question Desk has no question round with this ticket"
     );
 }
 
@@ -353,17 +350,6 @@ async fn the_desk_shows_when_no_agent_is_waiting_for_a_round_any_more() {
         tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-8")).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(connected(&h), "reattaching connects the round again");
-}
-
-fn agent_named(name: &str, title: Option<&str>) -> Agent {
-    let mut info = Implementation::new(name, "1.0");
-    if let Some(title) = title {
-        info = info.with_title(title);
-    }
-    Agent {
-        client_info: Some(info),
-        ..Agent::default()
-    }
 }
 
 #[tokio::test]

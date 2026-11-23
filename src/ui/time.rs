@@ -30,3 +30,16 @@ pub fn clock(time: SystemTime) -> String {
         format!("{}, {clock}", at.strftime("%b %-d %Y"))
     }
 }
+
+/// [`clock`] phrased after a verb: "today at 14:50", "yesterday at 14:50",
+/// "on Nov 21 at 14:50".
+pub fn when(time: SystemTime) -> String {
+    let text = clock(time);
+    if let Some(rest) = text.strip_prefix("yesterday ") {
+        format!("yesterday at {rest}")
+    } else if let Some((day, clock)) = text.split_once(", ") {
+        format!("on {day} at {clock}")
+    } else {
+        format!("today at {text}")
+    }
+}

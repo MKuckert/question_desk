@@ -68,6 +68,8 @@ struct Round {
     seen: bool,
     /// Draft edits not written to the store yet, since this instant.
     dirty_since: Option<Instant>,
+    /// Agents asking for this Delivered round's result again; never persisted.
+    redelivery: Option<Redelivery>,
 }
 
 /// What the user has entered for one Question so far.
@@ -166,8 +168,10 @@ pub enum QuestionState {
 
 /// A call waiting for a round's result.
 pub struct Attachment {
+    /// The round's id.
+    round: String,
     ticket: String,
-    result: watch::Receiver<Option<RoundResult>>,
+    wait: Wait,
     /// Counts this call as connected; released on drop.
     attached: Option<Arc<()>>,
     desk: Desk,
@@ -196,15 +200,81 @@ impl Attachment {
         &self.questions
     }
 
-    /// Resolves when the user Submits or Cancels the round.
-    pub async fn finished(&mut self) -> RoundResult {
-        let result = self
-            .result
-            .wait_for(Option::is_some)
-            .await
-            .expect("rounds live as long as the desk");
-        result.clone().expect("waited for a result")
+    /// Whether this call waits for the user's decision on a Re-delivery Request.
+    pub fn is_redelivery(&self) -> bool {
+        matches!(self.wait, Wait::Redelivery { .. })
     }
+
+    /// Resolves when the user Submits or Cancels the round, or decides a Re-delivery
+    /// Request; a declined request is an error message for the Agent.
+    pub async fn finished(&mut self) -> Result<RoundResult, String> {
+        match &mut self.wait {
+            Wait::Result(result) => {
+                let result = result
+                    .wait_for(Option::is_some)
+                    .await
+                    .expect("rounds live as long as the desk");
+                Ok(result.clone().expect("waited for a result"))
+            }
+            Wait::Redelivery { decision, result } => {
+                let deliver = *decision
+                    .wait_for(Option::is_some)
+                    .await
+                    .expect("requests live until decided");
+                if deliver == Some(true) {
+                    Ok(result.clone())
+                } else {
+                    Err(format!(
+                        "the user declined re-delivery of ticket {:?}; ask again with a new ticket or clarify with the user first.",
+                        self.ticket
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Records that the result was written to the Agent's response: the round is
+    /// Delivered and its Ticket released.
+    pub fn delivered(&self) {
+        let mut state = self.desk.lock();
+        if let Some(i) = state.rounds.iter().position(|r| r.id == self.round)
+            && !state.rounds[i].is_open()
+            && state.rounds[i].delivered_at.is_none()
+        {
+            state.rounds[i].delivered_at = Some(SystemTime::now());
+            state.save(i);
+        }
+    }
+}
+
+enum Wait {
+    /// For the round's result.
+    Result(watch::Receiver<Option<RoundResult>>),
+    /// For the user's decision on delivering a Delivered round's `result` again.
+    Redelivery {
+        decision: watch::Receiver<Option<bool>>,
+        result: RoundResult,
+    },
+}
+
+/// Agents asking for a Delivered round's result again, answered by one decision.
+struct Redelivery {
+    /// Agent Session labels of the requesting calls, in order, without repeats.
+    requesters: Vec<String>,
+    /// `Some(true)` to deliver again, `Some(false)` to decline.
+    decision: watch::Sender<Option<bool>>,
+}
+
+/// A pending Re-delivery Request, as the UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeliveryView {
+    /// The Delivered round's id.
+    pub id: String,
+    pub ticket: String,
+    /// The round's title, else its first question.
+    pub title: String,
+    pub requesters: Vec<String>,
+    pub delivered_at: SystemTime,
 }
 
 impl Desk {
@@ -269,17 +339,24 @@ impl Desk {
         client: Option<String>,
     ) -> Result<(Attachment, DeskEvent), String> {
         let mut state = self.lock();
-        if let Some(round) = state.rounds.iter().find(|r| r.ticket == input.ticket) {
-            if round.questions != input.questions {
-                return Err(format!(
-                    "ticket {:?} is already used by a different question round; choose a new unique ticket",
-                    input.ticket
-                ));
+        let session = session_label(client.as_deref(), input.source.as_deref());
+        if let Some(i) = state.holder(&input.ticket) {
+            let round = &state.rounds[i];
+            if round.delivered_at.is_none() {
+                if round.questions != input.questions {
+                    return Err(format!(
+                        "ticket {:?} is already used by a different question round; choose a new unique ticket",
+                        input.ticket
+                    ));
+                }
+                return Ok((round.attach(self), DeskEvent::Changed));
             }
-            return Ok((round.attach(self), DeskEvent::Changed));
+            if round.questions == input.questions {
+                return Ok(state.request_redelivery(i, session, self));
+            }
+            // Delivered with other Questions: the Ticket is free for a new round.
         }
         let (result, _) = watch::channel(None);
-        let session = session_label(client.as_deref(), input.source.as_deref());
         let id = state.new_id(&input.ticket);
         state.rounds.push(Round {
             id,
@@ -296,6 +373,7 @@ impl Desk {
             delivered_at: None,
             seen: false,
             dirty_since: None,
+            redelivery: None,
         });
         let last = state.rounds.len() - 1;
         state.save(last);
@@ -307,12 +385,69 @@ impl Desk {
     }
 
     /// Attaches to the round with this Ticket, open or finished; `None` if unknown.
-    pub fn pickup(&self, ticket: &str) -> Option<Attachment> {
-        self.lock()
+    /// A Delivered round raises a Re-delivery Request from `client` instead.
+    pub fn pickup(&self, ticket: &str, client: Option<String>) -> Option<Attachment> {
+        let mut state = self.lock();
+        let i = state.holder(ticket)?;
+        if state.rounds[i].delivered_at.is_none() {
+            return Some(state.rounds[i].attach(self));
+        }
+        let requester = session_label(client.as_deref(), None);
+        let (attachment, event) = state.request_redelivery(i, requester, self);
+        drop(state);
+        self.notify(event);
+        Some(attachment)
+    }
+
+    /// Pending Re-delivery Requests, oldest round first.
+    pub fn redeliveries(&self) -> Vec<RedeliveryView> {
+        let state = self.lock();
+        state
             .rounds
             .iter()
-            .find(|r| r.ticket == ticket)
-            .map(|r| r.attach(self))
+            .filter_map(|round| {
+                let request = round.redelivery.as_ref()?;
+                if request.decision.borrow().is_some() {
+                    return None;
+                }
+                Some(RedeliveryView {
+                    id: round.id.clone(),
+                    ticket: round.ticket.clone(),
+                    title: round
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| round.questions[0].question.clone()),
+                    requesters: request.requesters.clone(),
+                    delivered_at: round.delivered_at.unwrap_or(round.opened_at),
+                })
+            })
+            .collect()
+    }
+
+    /// Answers the round's Re-delivery Request: its waiting calls get the old result.
+    pub fn deliver_again(&self, id: &str) {
+        self.decide_redelivery(id, true);
+    }
+
+    /// Answers the round's Re-delivery Request: its waiting calls get an error.
+    pub fn decline_redelivery(&self, id: &str) {
+        self.decide_redelivery(id, false);
+    }
+
+    fn decide_redelivery(&self, id: &str, deliver: bool) {
+        let mut state = self.lock();
+        let Some(round) = state.rounds.iter_mut().find(|r| r.id == id) else {
+            return;
+        };
+        let Some(request) = &round.redelivery else {
+            return;
+        };
+        request.decision.send_replace(Some(deliver));
+        // With no call waiting right now (e.g. between two `wait_for_answers`), the
+        // decision is kept for the next one.
+        if request.decision.receiver_count() > 0 {
+            round.redelivery = None;
+        }
     }
 
     // ---- User side --------------------------------------------------------------------
@@ -566,6 +701,55 @@ impl State {
         self.selected_index().map(|i| &mut self.rounds[i])
     }
 
+    /// The round that answers to `ticket`: the latest one asked with it.
+    fn holder(&self, ticket: &str) -> Option<usize> {
+        self.rounds.iter().rposition(|r| r.ticket == ticket)
+    }
+
+    /// Adds `requester` to the Delivered round's Re-delivery Request, raising one if
+    /// there is none, and attaches the call to its decision.
+    fn request_redelivery(
+        &mut self,
+        i: usize,
+        requester: String,
+        desk: &Desk,
+    ) -> (Attachment, DeskEvent) {
+        let round = &mut self.rounds[i];
+        let event = if round.redelivery.is_some() {
+            DeskEvent::Changed
+        } else {
+            DeskEvent::RoundOpened
+        };
+        let request = round.redelivery.get_or_insert_with(|| Redelivery {
+            requesters: Vec::new(),
+            decision: watch::channel(None).0,
+        });
+        let decided = request.decision.borrow().is_some();
+        if !decided && !request.requesters.contains(&requester) {
+            request.requesters.push(requester);
+        }
+        let decision = request.decision.subscribe();
+        if decided {
+            // A decision kept for the next call is used up by it.
+            round.redelivery = None;
+        }
+        let result = round
+            .result
+            .borrow()
+            .clone()
+            .expect("a Delivered round is finished");
+        let attachment = Attachment {
+            round: round.id.clone(),
+            ticket: round.ticket.clone(),
+            wait: Wait::Redelivery { decision, result },
+            attached: None,
+            desk: desk.clone(),
+            title: round.title.clone(),
+            questions: round.questions.iter().map(|q| q.question.clone()).collect(),
+        };
+        (attachment, event)
+    }
+
     /// An id for a new round with `ticket`, used by no round in memory and no file.
     fn new_id(&self, ticket: &str) -> String {
         let taken = |id: &str| {
@@ -723,6 +907,7 @@ impl Round {
             delivered_at: stored.delivered_at.map(system_time),
             seen: true,
             dirty_since: None,
+            redelivery: None,
         };
         let outcome = match stored.status {
             store::Status::Open => None,
@@ -751,8 +936,9 @@ impl Round {
 
     fn attach(&self, desk: &Desk) -> Attachment {
         Attachment {
+            round: self.id.clone(),
             ticket: self.ticket.clone(),
-            result: self.result.subscribe(),
+            wait: Wait::Result(self.result.subscribe()),
             attached: Some(self.attached.clone()),
             desk: desk.clone(),
             title: self.title.clone(),

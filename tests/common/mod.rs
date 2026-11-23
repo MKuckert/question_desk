@@ -119,6 +119,17 @@ impl Harness {
         self.desk.select(&round.id);
     }
 
+    /// Waits until no Agent call is attached to the open round with this Ticket any more.
+    pub async fn disconnected(&self, ticket: &str) {
+        for _ in 0..200 {
+            if !self.appeared(ticket).await.connected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("round {ticket} stayed connected");
+    }
+
     /// Waits until the desk shows an open round with this Ticket.
     pub async fn appeared(&self, ticket: &str) -> RoundSummary {
         for _ in 0..200 {
@@ -179,4 +190,16 @@ pub fn db_round(ticket: &str) -> Value {
             }
         ]
     })
+}
+
+/// An Agent whose `clientInfo` has this name and optional title.
+pub fn agent_named(name: &str, title: Option<&str>) -> Agent {
+    let mut info = Implementation::new(name, "1.0");
+    if let Some(title) = title {
+        info = info.with_title(title);
+    }
+    Agent {
+        client_info: Some(info),
+        ..Agent::default()
+    }
 }

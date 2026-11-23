@@ -23,3 +23,8 @@ Spec: `../spec.md` (stories 4–6) · ADR 0007
 - [ ] Headless tests: same Questions → request appears, accept delivers the old result, decline gives the error.
 - [ ] Headless tests: pending `wait_for_answers` during a request, two requests folded.
 - [ ] Banner checked via `tools/screenshot.sh`.
+
+## Comments
+
+- Implemented on branch `persistence`. Later rounds that reuse a released Ticket are stored as `<ticket>@<n>.json` (`@` cannot occur in a Ticket). A decision made while no call is waiting (between two `wait_for_answers` calls) is kept for the next call with that Ticket.
+- The banner check could not be done with `tools/screenshot.sh` here: window capture is not permitted in this environment.

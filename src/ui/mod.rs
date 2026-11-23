@@ -25,8 +25,8 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use crate::{
     config::{self, Config},
     desk::{
-        Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundSummary, RoundView,
-        SessionView, Step,
+        Desk, DeskEvent, OptionView, QuestionState, QuestionView, RedeliveryView, RoundSummary,
+        RoundView, SessionView, Step,
     },
     server::{DEFAULT_HOST, DEFAULT_PORT, ServerControl},
 };
@@ -188,6 +188,7 @@ impl App {
         self.handle_close_request(&ctx);
 
         let sessions = self.desk.sessions();
+        let redeliveries = self.desk.redeliveries();
         let round = self.desk.current();
 
         let p = theme::of(ui);
@@ -209,7 +210,7 @@ impl App {
             .min_size(200.0)
             .frame(Frame::new().fill(p.panel).inner_margin(SPACE_M))
             .show_collapsible(ui, &mut sidebar_open, |ui| {
-                self.sidebar(ui, &sessions, round.as_ref())
+                self.sidebar(ui, &sessions, &redeliveries, round.as_ref())
             });
         self.sidebar_open = sidebar_open;
         egui::CentralPanel::default()
@@ -364,6 +365,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         sessions: &[SessionView],
+        redeliveries: &[RedeliveryView],
         current: Option<&RoundView>,
     ) {
         let p = theme::of(ui);
@@ -373,7 +375,8 @@ impl App {
                     .font(theme::semibold(theme::TEXT_SMALL))
                     .color(p.muted),
             );
-            let open: usize = sessions.iter().map(|s| s.rounds.len()).sum();
+            let open: usize =
+                sessions.iter().map(|s| s.rounds.len()).sum::<usize>() + redeliveries.len();
             if open > 0 {
                 theme::neutral_chip(ui, &open.to_string());
             }
@@ -381,8 +384,11 @@ impl App {
         ui.add_space(SPACE_XS);
         ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = SPACE_XS;
-            if sessions.is_empty() {
+            if sessions.is_empty() && redeliveries.is_empty() {
                 ui.label(RichText::new("Nothing waiting").color(p.muted));
+            }
+            for request in redeliveries {
+                self.redelivery_banner(ui, request);
             }
             for session in sessions {
                 ui.add_space(SPACE_S);
@@ -407,6 +413,38 @@ impl App {
                     }
                 }
             }
+        });
+    }
+
+    /// A Re-delivery Request: who wants which Delivered result again, and the decision.
+    fn redelivery_banner(&mut self, ui: &mut egui::Ui, request: &RedeliveryView) {
+        let p = theme::of(ui);
+        card_frame(theme::tint(p.warn, 0.12), Stroke::new(1.0, p.warn)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(icon(icons::WARN, 16.0, p.warn));
+                ui.label(
+                    RichText::new(format!(
+                        "{} wants to receive answers for “{}”, already delivered {}.",
+                        request.requesters.join(", "),
+                        request.title,
+                        time::when(request.delivered_at)
+                    ))
+                    .color(p.text_strong),
+                );
+            });
+            ui.add_space(SPACE_XS);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("Deliver again").with_class(theme::PRIMARY))
+                    .clicked()
+                {
+                    self.desk.deliver_again(&request.id);
+                }
+                if ui.button("Decline").clicked() {
+                    self.desk.decline_redelivery(&request.id);
+                }
+            });
         });
     }
 
