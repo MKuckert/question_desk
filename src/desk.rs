@@ -551,6 +551,21 @@ impl Desk {
         self.lock().filter.clone()
     }
 
+    /// The round with this id as it is (or would be) stored, drafts included.
+    pub fn export(&self, id: &str) -> Option<StoredRound> {
+        let state = self.lock();
+        state
+            .rounds
+            .iter()
+            .find(|r| r.id == id)
+            .map(Round::to_stored)
+    }
+
+    /// The JSON export of a round: the contents of its file in the store.
+    pub fn export_json(&self, id: &str) -> Option<String> {
+        self.export(id).map(|round| store::to_json(&round))
+    }
+
     /// The selected round, open or finished, if any.
     pub fn current(&self) -> Option<RoundView> {
         let state = self.lock();

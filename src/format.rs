@@ -164,7 +164,7 @@ fn paragraph(text: &str) -> Vec<Event<'static>> {
 
 /// `**label** text`, keeping the user's line breaks; the text is escaped by the writer.
 /// Blank lines start further paragraphs, so the text stays inside the section.
-fn labelled(label: &'static str, text: &str) -> Vec<Event<'static>> {
+pub(crate) fn labelled(label: &'static str, text: &str) -> Vec<Event<'static>> {
     let mut paragraphs: Vec<Vec<&str>> = vec![Vec::new()];
     for line in text.lines() {
         match paragraphs.last_mut() {

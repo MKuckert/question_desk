@@ -105,6 +105,8 @@ pub fn run(
                 sidebar_open: true,
                 history_open: false,
                 filter: String::new(),
+                export: None,
+                notice: None,
                 dialog: None,
                 settings: None,
                 closing: false,
@@ -154,6 +156,10 @@ struct App {
     history_open: bool,
     /// The sidebar's filter query, as typed.
     filter: String,
+    /// The id of the round to export after this frame.
+    export: Option<String>,
+    /// A message for the user, e.g. why an export failed, shown until dismissed.
+    notice: Option<String>,
     dialog: Option<Dialog>,
     /// The open settings dialog.
     settings: Option<SettingsForm>,
@@ -262,10 +268,64 @@ impl App {
         }
         self.dialogs(&ctx, round.as_ref());
         self.settings_dialog(&ctx);
+        self.notice_dialog(&ctx);
+        if let Some(id) = self.export.take() {
+            self.export_round(&id);
+        }
+    }
+
+    /// Asks where to save the round and writes it there: JSON for a `.json` file name,
+    /// else Markdown.
+    fn export_round(&mut self, id: &str) {
+        let Some(round) = self.desk.export(id) else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export round")
+            .set_file_name(format!("{}.md", round.id))
+            .add_filter("Markdown", &["md"])
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let text = if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            crate::store::to_json(&round)
+        } else {
+            crate::export::markdown(&round, &jiff::tz::TimeZone::system())
+        };
+        if let Err(e) = std::fs::write(&path, text) {
+            log::error!("cannot export to {}: {e}", path.display());
+            self.notice = Some(format!(
+                "The round could not be exported to {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
+    fn notice_dialog(&mut self, ctx: &egui::Context) {
+        let Some(notice) = &self.notice else { return };
+        let style = ctx.global_style();
+        let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("notice"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(notice.as_str());
+                ui.add_space(SPACE_L);
+                close = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+            });
+        if close || modal.should_close() {
+            self.notice = None;
+        }
     }
 
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.settings.is_some()
+        self.dialog.is_some() || self.settings.is_some() || self.notice.is_some()
     }
 
     /// On a new round: bring the window to the front and ask for attention (dock bounce,
@@ -373,6 +433,13 @@ impl App {
                     self.open_settings();
                 }
                 let Some(round) = round else { return };
+                if ui
+                    .add(egui::Button::new("Export round…").with_class(theme::GHOST))
+                    .on_hover_text("Save this round as Markdown or JSON")
+                    .clicked()
+                {
+                    self.export = Some(round.id.clone());
+                }
                 ui.add_space(SPACE_S);
                 if let Some(finished) = &round.finished {
                     theme::neutral_chip(ui, outcome_label(finished.outcome));
@@ -454,9 +521,11 @@ impl App {
                             .selected(selected)
                             .with_class(theme::NAV)
                             .min_size(egui::vec2(ui.available_width(), 0.0));
-                        if ui.add(button).clicked() {
+                        let response = ui.add(button);
+                        if response.clicked() {
                             self.desk.select(&round.id);
                         }
+                        self.round_menu(&response, &round.id);
                     }
                 }
             });
@@ -480,6 +549,15 @@ impl App {
             self.filter.clear();
         }
         self.desk.set_filter(&self.filter);
+    }
+
+    /// The context menu of a round's sidebar entry.
+    fn round_menu(&mut self, response: &egui::Response, id: &str) {
+        response.context_menu(|ui| {
+            if ui.button("Export round…").clicked() {
+                self.export = Some(id.to_owned());
+            }
+        });
     }
 
     fn toggle_history(&mut self) {
@@ -537,9 +615,11 @@ impl App {
                         .selected(selected)
                         .with_class(theme::NAV)
                         .min_size(egui::vec2(ui.available_width(), 0.0));
-                    if ui.add(button).clicked() {
+                    let response = ui.add(button);
+                    if response.clicked() {
                         self.desk.select(&entry.id);
                     }
+                    self.round_menu(&response, &entry.id);
                 }
             });
     }

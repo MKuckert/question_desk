@@ -25,6 +25,7 @@ toml = "1.2.1"
 tracing = "0.1.44"
 unicode-segmentation = "1.13.3"
 jiff = { version = "1.0.2", features = ["serde"] }
+rfd = "0.18.0"
 
 [dev-dependencies]
 insta = "1.49.0"
