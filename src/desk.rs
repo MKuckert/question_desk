@@ -5,6 +5,7 @@
 //! HTTP types cross this interface.
 
 use std::{
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, Weak},
     time::{Duration, Instant, SystemTime},
 };
@@ -46,6 +47,10 @@ struct State {
     selected: Option<String>,
     /// Where rounds are persisted; `None` keeps them in memory only.
     store: Option<Store>,
+    /// The draft writer thread runs (it is started with the first store).
+    writing_drafts: bool,
+    /// Stored rounds left behind when persistence was switched off, to offer deleting.
+    delete_offer: Option<DeleteOffer>,
     /// The filter's terms; open rounds and History show only matching rounds.
     filter: Vec<String>,
 }
@@ -242,17 +247,19 @@ impl Attachment {
     pub async fn finished(&mut self) -> Result<RoundResult, String> {
         match &mut self.wait {
             Wait::Result(result) => {
+                // A round is only deleted after it finished, so this sees its result.
                 let result = result
                     .wait_for(Option::is_some)
                     .await
-                    .expect("rounds live as long as the desk");
+                    .map_err(|_| "the user deleted the question round".to_owned())?;
                 Ok(result.clone().expect("waited for a result"))
             }
             Wait::Redelivery { decision, result } => {
-                let deliver = *decision
+                // A deleted round's request is declined.
+                let deliver = decision
                     .wait_for(Option::is_some)
                     .await
-                    .expect("requests live until decided");
+                    .map_or(Some(false), |d| *d);
                 if deliver == Some(true) {
                     Ok(result.clone())
                 } else {
@@ -297,6 +304,21 @@ struct Redelivery {
     decision: watch::Sender<Option<bool>>,
 }
 
+/// Where and whether rounds are stored (see `config.toml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageSettings {
+    pub persistence: bool,
+    /// `None` when there is no data dir (no home directory): rounds stay in memory.
+    pub data_dir: Option<PathBuf>,
+}
+
+/// The rounds still stored in `data_dir` after persistence was switched off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteOffer {
+    pub data_dir: PathBuf,
+    pub count: usize,
+}
+
 /// A pending Re-delivery Request, as the UI shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedeliveryView {
@@ -314,12 +336,162 @@ impl Desk {
     pub fn with_store(store: Store) -> Self {
         let desk = Desk::default();
         desk.lock().attach_store(store);
-        let state = Arc::downgrade(&desk.state);
+        desk.start_draft_writer();
+        desk
+    }
+
+    fn start_draft_writer(&self) {
+        let mut state = self.lock();
+        if state.writing_drafts {
+            return;
+        }
+        state.writing_drafts = true;
+        let state = Arc::downgrade(&self.state);
         std::thread::Builder::new()
             .name("draft-writer".into())
             .spawn(move || write_drafts_until_dropped(state))
             .expect("draft writer thread starts");
-        desk
+    }
+
+    /// Applies changed storage settings at once. Switching persistence off stops all
+    /// writing and keeps the rounds in memory; the stored ones are offered for deletion
+    /// (see [`Desk::take_delete_offer`]). A new data dir gets all rounds in memory, plus
+    /// those already stored there; the old one is left untouched.
+    pub fn apply_storage(&self, settings: StorageSettings) {
+        let target = settings
+            .data_dir
+            .filter(|_| settings.persistence)
+            .map(Store::new);
+        let mut state = self.lock();
+        if state.store == target {
+            return;
+        }
+        let previous = state.store.take();
+        match target {
+            None => {
+                if let Some(previous) = previous {
+                    log::info!("persistence switched off");
+                    let count = previous.load().rounds.len();
+                    if !settings.persistence && count > 0 {
+                        state.delete_offer = Some(DeleteOffer {
+                            data_dir: previous.data_dir().to_owned(),
+                            count,
+                        });
+                    }
+                }
+            }
+            Some(store) => {
+                log::info!("storing question rounds in {}", store.data_dir().display());
+                state.delete_offer = None;
+                state.attach_store(store);
+                for i in 0..state.rounds.len() {
+                    state.save(i);
+                }
+            }
+        }
+        let persistent = state.store.is_some();
+        drop(state);
+        if persistent {
+            self.start_draft_writer();
+        }
+        self.notify(DeskEvent::Changed);
+    }
+
+    /// The offer to delete stored rounds after persistence was switched off, once.
+    pub fn take_delete_offer(&self) -> Option<DeleteOffer> {
+        self.lock().delete_offer.take()
+    }
+
+    /// Deletes the stored rounds of an accepted [`DeleteOffer`]; the rounds stay in
+    /// memory for this session.
+    pub fn delete_stored(&self, offer: &DeleteOffer) {
+        let removed = Store::new(&offer.data_dir).remove_all();
+        log::info!(
+            "deleted {removed} stored question round(s) from {}",
+            offer.data_dir.display()
+        );
+    }
+
+    /// Deletes finished rounds that finished more than `retention_days` ago, from memory
+    /// and store; `0` keeps them forever. Open rounds are never pruned, and nothing is
+    /// pruned while persistence is off.
+    pub fn prune(&self, retention_days: u32) {
+        if retention_days == 0 || !self.is_persistent() {
+            return;
+        }
+        let max_age = Duration::from_secs(u64::from(retention_days) * 24 * 60 * 60);
+        let ids: Vec<String> = {
+            let state = self.lock();
+            state
+                .rounds
+                .iter()
+                .filter(|r| {
+                    r.finished_at
+                        .is_some_and(|at| at.elapsed().is_ok_and(|age| age > max_age))
+                        && !r.is_open()
+                })
+                .map(|r| r.id.clone())
+                .collect()
+        };
+        if !ids.is_empty() {
+            log::info!(
+                "pruning {} question round(s) finished over {retention_days} days ago",
+                ids.len()
+            );
+        }
+        self.delete_where(|r| ids.contains(&r.id));
+    }
+
+    /// Deletes a round from memory and store; an open one is cancelled first, so its
+    /// Agent receives `cancelled`.
+    pub fn delete(&self, id: &str) {
+        self.delete_where(|r| r.id == id);
+    }
+
+    /// Deletes all rounds, open and finished, of an Agent Session.
+    pub fn delete_session(&self, label: &str) {
+        self.delete_where(|r| r.session == label);
+    }
+
+    /// Deletes all finished rounds.
+    pub fn clear_history(&self) {
+        self.delete_where(|r| !r.is_open());
+    }
+
+    fn delete_where(&self, doomed: impl Fn(&Round) -> bool) {
+        let mut state = self.lock();
+        let mut i = 0;
+        let mut deleted = false;
+        while i < state.rounds.len() {
+            if !doomed(&state.rounds[i]) {
+                i += 1;
+                continue;
+            }
+            let round = &mut state.rounds[i];
+            if round.is_open() {
+                round.finish(Outcome::Cancelled);
+            }
+            if let Some(request) = round.redelivery.take() {
+                request.decision.send_replace(Some(false));
+            }
+            let round = state.rounds.remove(i);
+            if let Some(store) = &state.store
+                && let Err(e) = store.remove(&round.id)
+            {
+                log::error!("cannot delete question round {:?}: {e}", round.id);
+            }
+            if state.selected.as_ref() == Some(&round.id) {
+                state.selected = None;
+            }
+            deleted = true;
+        }
+        if deleted {
+            if state.selected.is_none() {
+                state.select_first_open();
+            }
+            drop(state);
+            self.notify(DeskEvent::Changed);
+        }
     }
 
     /// Whether rounds are written to a store and so survive a quit.

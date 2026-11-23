@@ -25,8 +25,8 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use crate::{
     config::{self, Config},
     desk::{
-        Desk, DeskEvent, FinishedView, HistoryEntry, OptionView, QuestionState, QuestionView,
-        RedeliveryView, RoundSummary, RoundView, SessionView, Step,
+        DeleteOffer, Desk, DeskEvent, FinishedView, HistoryEntry, OptionView, QuestionState,
+        QuestionView, RedeliveryView, RoundSummary, RoundView, SessionView, Step,
     },
     format::Outcome,
     server::{DEFAULT_HOST, DEFAULT_PORT, ServerControl},
@@ -104,6 +104,7 @@ pub fn run(
                 restore_window_level: false,
                 sidebar_open: true,
                 history_open: false,
+                focused: false,
                 filter: String::new(),
                 export: None,
                 notice: None,
@@ -133,11 +134,18 @@ enum NoteFocus {
     Leave,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Dialog {
     Cancel,
     SubmitUnanswered,
     Close,
+    /// Delete the round with this id.
+    DeleteRound(String),
+    /// Delete every round of the Agent Session with this label.
+    DeleteSession(String),
+    ClearHistory,
+    /// Persistence was switched off; delete what is stored, too?
+    DeleteStored(DeleteOffer),
 }
 
 struct App {
@@ -154,6 +162,8 @@ struct App {
     sidebar_open: bool,
     /// The History section is expanded; collapsed, only its header shows at the bottom.
     history_open: bool,
+    /// The window had the focus last frame.
+    focused: bool,
     /// The sidebar's filter query, as typed.
     filter: String,
     /// The id of the round to export after this frame.
@@ -201,6 +211,11 @@ impl App {
     fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.zoom = Some(ctx.zoom_factor());
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.focused {
+            self.reload_storage_settings();
+        }
+        self.focused = focused;
         self.request_attention(&ctx);
         self.handle_close_request(&ctx);
 
@@ -266,8 +281,13 @@ impl App {
             self.sidebar_open = true;
             ctx.memory_mut(|m| m.request_focus(filter_id()));
         }
-        self.dialogs(&ctx, round.as_ref());
+        if self.dialog.is_none()
+            && let Some(offer) = self.desk.take_delete_offer()
+        {
+            self.dialog = Some(Dialog::DeleteStored(offer));
+        }
         self.settings_dialog(&ctx);
+        self.dialogs(&ctx, round.as_ref());
         self.notice_dialog(&ctx);
         if let Some(id) = self.export.take() {
             self.export_round(&id);
@@ -321,6 +341,21 @@ impl App {
             });
         if close || modal.should_close() {
             self.notice = None;
+        }
+    }
+
+    /// Picks up hand edits of the storage settings in `config.toml`. Server settings
+    /// need a restart (or the settings dialog) to apply.
+    fn reload_storage_settings(&mut self) {
+        let Some(path) = config::path() else { return };
+        match config::load_from(&path) {
+            Ok(edited) => {
+                self.config.retention_days = edited.retention_days;
+                self.config.data_dir = edited.data_dir.clone();
+                self.config.persistence = edited.persistence;
+                self.desk.apply_storage(edited.storage());
+            }
+            Err(e) => log::warn!("not applying the edited settings: {e}"),
         }
     }
 
@@ -525,7 +560,7 @@ impl App {
                         if response.clicked() {
                             self.desk.select(&round.id);
                         }
-                        self.round_menu(&response, &round.id);
+                        self.round_menu(&response, &round.id, &session.label);
                     }
                 }
             });
@@ -552,10 +587,17 @@ impl App {
     }
 
     /// The context menu of a round's sidebar entry.
-    fn round_menu(&mut self, response: &egui::Response, id: &str) {
+    fn round_menu(&mut self, response: &egui::Response, id: &str, session: &str) {
         response.context_menu(|ui| {
             if ui.button("Export round…").clicked() {
                 self.export = Some(id.to_owned());
+            }
+            ui.separator();
+            if ui.button("Delete round…").clicked() {
+                self.dialog = Some(Dialog::DeleteRound(id.to_owned()));
+            }
+            if ui.button("Delete Agent Session…").clicked() {
+                self.dialog = Some(Dialog::DeleteSession(session.to_owned()));
             }
         });
     }
@@ -619,7 +661,7 @@ impl App {
                     if response.clicked() {
                         self.desk.select(&entry.id);
                     }
-                    self.round_menu(&response, &entry.id);
+                    self.round_menu(&response, &entry.id, &entry.session);
                 }
             });
     }
@@ -1198,8 +1240,10 @@ impl App {
     // ---- Dialogs --------------------------------------------------------------------------
 
     fn dialogs(&mut self, ctx: &egui::Context, round: Option<&RoundView>) {
-        let Some(dialog) = self.dialog else { return };
-        let (title, text, confirm) = match dialog {
+        let Some(dialog) = self.dialog.clone() else {
+            return;
+        };
+        let (title, text, confirm) = match &dialog {
             Dialog::Cancel => (
                 "Cancel this round?",
                 "The Agent receives the answers you gave so far, marked as cancelled.".to_owned(),
@@ -1219,11 +1263,63 @@ impl App {
                     .to_owned(),
                 "Cancel rounds and quit",
             ),
+            Dialog::DeleteRound(id) => {
+                let round = self.desk.export(id);
+                let name = round
+                    .as_ref()
+                    .and_then(|r| r.title.clone())
+                    .map_or_else(|| "The round".to_owned(), |t| format!("“{t}”"));
+                let open = round.is_some_and(|r| r.status == crate::store::Status::Open);
+                (
+                    "Delete this round?",
+                    format!(
+                        "{name} is removed from this list and from disk.{}",
+                        if open {
+                            " It is still open: its Agent receives it as cancelled."
+                        } else {
+                            ""
+                        }
+                    ),
+                    "Delete round",
+                )
+            }
+            Dialog::DeleteSession(label) => (
+                "Delete this Agent Session?",
+                format!(
+                    "All rounds of “{label}”, open and finished, are removed from this list \
+                     and from disk. Open ones are cancelled first."
+                ),
+                "Delete all its rounds",
+            ),
+            Dialog::ClearHistory => (
+                "Clear all History?",
+                format!(
+                    "All {} finished round(s) are removed from this list and from disk. Open \
+                     rounds stay.",
+                    self.desk.history().len()
+                ),
+                "Clear History",
+            ),
+            Dialog::DeleteStored(offer) => (
+                "Also delete the stored rounds?",
+                format!(
+                    "Rounds are no longer written to disk. {} round(s) are still stored in {}; \
+                     they stay visible until you quit.",
+                    offer.count,
+                    home_relative(&offer.data_dir)
+                ),
+                "Delete",
+            ),
+        };
+        let dismiss = match &dialog {
+            Dialog::Cancel | Dialog::SubmitUnanswered | Dialog::Close => "Keep answering",
+            Dialog::DeleteStored(_) => "Keep",
+            _ => "Cancel",
         };
         let mut decision = None;
         let confirm_class = match dialog {
             Dialog::SubmitUnanswered => theme::PRIMARY,
-            Dialog::Cancel | Dialog::Close => theme::DANGER,
+            _ => theme::DANGER,
         };
         let style = ctx.global_style();
         let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
@@ -1242,7 +1338,7 @@ impl App {
                     {
                         decision = Some(true);
                     }
-                    if ui.button("Keep answering").clicked() {
+                    if ui.button(dismiss).clicked() {
                         decision = Some(false);
                     }
                 });
@@ -1265,6 +1361,10 @@ impl App {
                         self.closing = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    Dialog::DeleteRound(id) => self.desk.delete(&id),
+                    Dialog::DeleteSession(label) => self.desk.delete_session(&label),
+                    Dialog::ClearHistory => self.desk.clear_history(),
+                    Dialog::DeleteStored(offer) => self.desk.delete_stored(&offer),
                 }
             }
             Some(false) => self.dialog = None,
@@ -1283,6 +1383,9 @@ impl App {
             return;
         };
         let mut decision = None;
+        let mut clear_history = false;
+        // A confirmation on top of the settings gets the keys.
+        let confirming = self.dialog.is_some();
         let style = ctx.global_style();
         let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
         let modal = egui::Modal::new(egui::Id::unique("settings"))
@@ -1294,7 +1397,7 @@ impl App {
                 ui.add_space(SPACE_XS);
                 ui.label(
                     RichText::new(
-                        "Where Agents reach the MCP server. Saving restarts the server; \
+                        "Where Agents reach the MCP server. Changing it restarts the server; \
                          Agents already waiting for answers stay connected.",
                     )
                     .color(p.muted),
@@ -1330,6 +1433,54 @@ impl App {
                         ui.checkbox(&mut form.show_token, "Show token");
                         ui.end_row();
                     });
+                ui.add_space(SPACE_L);
+                ui.label(
+                    RichText::new("STORED ROUNDS")
+                        .font(theme::semibold(theme::TEXT_SMALL))
+                        .color(p.muted),
+                );
+                ui.add_space(SPACE_XS);
+                ui.checkbox(
+                    &mut form.persistence,
+                    "Keep rounds on disk, so they survive a quit and form the History",
+                );
+                ui.add_space(SPACE_XS);
+                egui::Grid::new("storage-fields")
+                    .num_columns(2)
+                    .spacing([SPACE_M, SPACE_S])
+                    .show(ui, |ui| {
+                        ui.label("Keep for");
+                        ui.horizontal(|ui| {
+                            ui.add_enabled(
+                                form.persistence,
+                                TextEdit::singleline(&mut form.retention_days)
+                                    .hint_text(config::DEFAULT_RETENTION_DAYS.to_string())
+                                    .desired_width(56.0),
+                            );
+                            ui.label(
+                                RichText::new("days after finishing (0 = forever)").color(p.muted),
+                            );
+                        });
+                        ui.end_row();
+                        ui.label("Folder");
+                        let default = crate::store::default_data_dir()
+                            .map(|d| home_relative(&d))
+                            .unwrap_or_default();
+                        ui.add_enabled(
+                            form.persistence,
+                            TextEdit::singleline(&mut form.data_dir)
+                                .hint_text(default)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(SPACE_S);
+                if ui
+                    .add(egui::Button::new("Clear all History…").with_class(theme::DANGER))
+                    .clicked()
+                {
+                    clear_history = true;
+                }
                 let mut warnings = Vec::new();
                 if !is_loopback(&form.host) {
                     let mut warning = "Other machines can reach this address.".to_owned();
@@ -1366,11 +1517,14 @@ impl App {
                             .color(p.muted),
                     );
                 }
-                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                if !confirming && ui.input(|i| i.key_pressed(Key::Enter)) {
                     decision = Some(true);
                 }
             });
-        if modal.should_close() && decision.is_none() {
+        if clear_history {
+            self.dialog = Some(Dialog::ClearHistory);
+        }
+        if modal.should_close() && decision.is_none() && !confirming {
             decision = Some(false);
         }
         let close = match decision {
@@ -1393,7 +1547,13 @@ impl App {
                 return false;
             }
         };
-        if config != self.config || !self.server.is_running() {
+        let server_changed = (&config.host, config.port, &config.bearer_token)
+            != (
+                &self.config.host,
+                self.config.port,
+                &self.config.bearer_token,
+            );
+        if server_changed || !self.server.is_running() {
             let result = self.server.restart(config.server_settings());
             if let Err(e) = result {
                 form.error = Some(e.clone());
@@ -1403,8 +1563,10 @@ impl App {
                 return false;
             }
             self.status = server_status(result);
-            self.config = config.clone();
         }
+        self.config = config.clone();
+        self.desk.apply_storage(config.storage());
+        self.desk.prune(config.retention_days);
         match config::save(&config) {
             Ok(path) => {
                 log::info!("saved settings to {}", path.display());
@@ -1426,6 +1588,10 @@ struct SettingsForm {
     port: String,
     token: String,
     show_token: bool,
+    persistence: bool,
+    retention_days: String,
+    /// Empty for the default data dir.
+    data_dir: String,
     /// Why the last save failed.
     error: Option<String>,
 }
@@ -1437,6 +1603,13 @@ impl SettingsForm {
             port: config.port.to_string(),
             token: config.bearer_token.clone().unwrap_or_default(),
             show_token: false,
+            persistence: config.persistence,
+            retention_days: config.retention_days.to_string(),
+            data_dir: config
+                .data_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
             error: None,
         }
     }
@@ -1451,10 +1624,20 @@ impl SettingsForm {
             .filter(|&p| p != 0)
             .ok_or("The port must be a number between 1 and 65535.")?;
         let token = self.token.trim();
+        let retention_days = match self.retention_days.trim() {
+            "" => config::DEFAULT_RETENTION_DAYS,
+            days => days
+                .parse::<u32>()
+                .map_err(|_| "Keep for: the days must be a whole number, 0 for forever.")?,
+        };
+        let data_dir = self.data_dir.trim();
         let config = Config {
             host: self.host.trim().to_owned(),
             port,
             bearer_token: (!token.is_empty()).then(|| token.to_owned()),
+            retention_days,
+            data_dir: (!data_dir.is_empty()).then(|| data_dir.into()),
+            persistence: self.persistence,
         };
         config::validate(&config)?;
         Ok(config)

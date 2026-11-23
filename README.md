@@ -44,6 +44,18 @@ bearer_token = "a-long-random-string"   # optional; clients must send it
 
 With `bearer_token` set, requests without `Authorization: Bearer <token>` get `401`. Requests carrying an `Origin` header always get `403`, so web pages cannot reach the port. If you listen on anything other than localhost, set a token.
 
+### Stored rounds and History
+
+Every question round, open or finished, is stored as one JSON file in `<data_dir>/rounds/` (owner-only permissions). Open rounds, your draft answers and results no Agent has picked up yet survive a quit or crash. Finished rounds form the **History** below the open rounds (`⌘Y` / `Ctrl+Y`): read-only, filterable (`⌘F` / `Ctrl+F`), exportable as Markdown or JSON, and deletable from the context menu of a round.
+
+```toml
+persistence = true          # default; false keeps rounds in memory only
+retention_days = 90         # default; finished rounds are deleted this long after finishing, 0 = forever
+data_dir = "~/rounds"       # default: ~/.local/share/question-desk ($XDG_DATA_HOME), Windows: the app data dir
+```
+
+These settings apply without a restart: when you save them in Settings, and when you edit `config.toml` by hand and switch back to the window. Pruning runs at startup and once a day. Changing `data_dir` writes the current rounds to the new folder and leaves the old one as it is.
+
 ## Connect Claude Code
 
 1. Add the server (here for your user; use `--scope project` to share it via `.mcp.json`):

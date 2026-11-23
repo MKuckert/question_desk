@@ -3,6 +3,7 @@ pub mod config;
 pub mod desk;
 pub mod export;
 pub mod format;
+pub mod housekeeping;
 pub mod schema;
 pub mod search;
 pub mod server;

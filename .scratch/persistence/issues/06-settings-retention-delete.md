@@ -22,3 +22,8 @@ Spec: `../spec.md` (stories 14–18) · ADR 0007
 - [ ] Headless tests: data_dir switch, persistence off (no writes, delete offer).
 - [ ] Headless tests: delete cancels an open round.
 - [ ] Config tests for the new keys and defaults (`tests/config.rs`).
+
+## Comments
+
+- Implemented on branch `persistence`. New config keys `retention_days`, `data_dir` (absolute or `~/…`) and `persistence` can also be set in Settings, together with "Clear all History…". `src/housekeeping.rs` re-reads the config, applies the storage settings and prunes, at startup and then daily. On window focus the storage settings are re-read and applied, without pruning. Deleting a round or an Agent Session is in the context menu of a sidebar entry. Deleting a round with a pending Re-delivery Request declines the request.
+- Switching persistence on writes the rounds in memory to the folder and also loads the rounds already stored there.
