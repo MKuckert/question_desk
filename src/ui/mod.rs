@@ -38,6 +38,8 @@ use theme::{SPACE_L, SPACE_M, SPACE_S, SPACE_XS};
 const ZOOM_KEY: &str = "zoom_factor";
 /// Expands and collapses the History section.
 const HISTORY_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+/// Focuses the filter field.
+const FILTER_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 /// Below this width of the page the preview panel moves under the Options.
 const WIDE_LAYOUT: f32 = 720.0;
 /// The widest the page content gets.
@@ -102,6 +104,7 @@ pub fn run(
                 restore_window_level: false,
                 sidebar_open: true,
                 history_open: false,
+                filter: String::new(),
                 dialog: None,
                 settings: None,
                 closing: false,
@@ -149,6 +152,8 @@ struct App {
     sidebar_open: bool,
     /// The History section is expanded; collapsed, only its header shows at the bottom.
     history_open: bool,
+    /// The sidebar's filter query, as typed.
+    filter: String,
     dialog: Option<Dialog>,
     /// The open settings dialog.
     settings: Option<SettingsForm>,
@@ -193,6 +198,8 @@ impl App {
         self.request_attention(&ctx);
         self.handle_close_request(&ctx);
 
+        let terms = self.desk.filter_terms();
+        ctx.data_mut(|d| d.insert_temp(filter_terms_id(), terms));
         let sessions = self.desk.sessions();
         let redeliveries = self.desk.redeliveries();
         let history = self.desk.history();
@@ -248,6 +255,10 @@ impl App {
         }
         if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&HISTORY_SHORTCUT)) {
             self.toggle_history();
+        }
+        if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&FILTER_SHORTCUT)) {
+            self.sidebar_open = true;
+            ctx.memory_mut(|m| m.request_focus(filter_id()));
         }
         self.dialogs(&ctx, round.as_ref());
         self.settings_dialog(&ctx);
@@ -391,6 +402,8 @@ impl App {
         current: Option<&RoundView>,
     ) {
         let p = theme::of(ui);
+        self.filter_field(ui);
+        ui.add_space(SPACE_S);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("OPEN ROUNDS")
@@ -448,6 +461,25 @@ impl App {
                 }
             });
         self.history_section(ui, history, current);
+    }
+
+    /// Filters open rounds and History as the user types; Esc clears it.
+    fn filter_field(&mut self, ui: &mut egui::Ui) {
+        let response = ui.add(
+            TextEdit::singleline(&mut self.filter)
+                .id(filter_id())
+                .hint_text(format!("Filter rounds ({}F)", cmd_symbol()))
+                .desired_width(f32::INFINITY),
+        );
+        if response.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.filter.clear();
+            response.surrender_focus();
+        }
+        // egui drops the focus on Esc itself, so check the frame it was lost in too.
+        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.filter.clear();
+        }
+        self.desk.set_filter(&self.filter);
     }
 
     fn toggle_history(&mut self) {
@@ -629,11 +661,12 @@ impl App {
         ScrollArea::vertical()
             .id_salt(("page", &round.ticket, index))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(&question.question)
-                        .font(theme::semibold(theme::TEXT_TITLE))
-                        .color(p.text_strong),
-                );
+                ui.label(marked(
+                    ui,
+                    &question.question,
+                    theme::semibold(theme::TEXT_TITLE),
+                    p.text_strong,
+                ));
                 ui.add_space(SPACE_S);
                 if let Some(body) = &question.body {
                     card_frame(p.surface, Stroke::new(1.0, p.border)).show(ui, |ui| {
@@ -835,11 +868,12 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("{}.", index + 1)).color(p.muted));
             theme::neutral_chip(ui, &question.header);
-            ui.label(
-                RichText::new(&question.question)
-                    .font(theme::semibold(theme::TEXT_BODY))
-                    .color(p.text_strong),
-            );
+            ui.label(marked(
+                ui,
+                &question.question,
+                theme::semibold(theme::TEXT_BODY),
+                p.text_strong,
+            ));
         });
         if let Some(body) = &question.body {
             ui.add_space(SPACE_XS);
@@ -857,16 +891,17 @@ impl App {
                 } else {
                     p.text
                 };
-                ui.label(
-                    RichText::new(&option.label)
-                        .font(theme::semibold(theme::TEXT_BODY))
-                        .color(color),
-                );
+                ui.label(marked(
+                    ui,
+                    &option.label,
+                    theme::semibold(theme::TEXT_BODY),
+                    color,
+                ));
                 if option.recommended {
                     theme::accent_chip(ui, "Recommended");
                 }
                 if !option.description.is_empty() {
-                    ui.label(RichText::new(&option.description).color(p.muted));
+                    ui.label(marked(ui, &option.description, body_font(ui), p.muted));
                 }
             });
         }
@@ -885,12 +920,17 @@ impl App {
             }
             // Without a selection, the Note is the Answer.
             (Some(answer), false) => {
-                ui.label(RichText::new(format!("Answer: {answer}")).color(p.text));
+                ui.label(marked(
+                    ui,
+                    &format!("Answer: {answer}"),
+                    body_font(ui),
+                    p.text,
+                ));
             }
             (Some(_), true) => {}
         }
         if let Some(note) = &question.answer_note {
-            ui.label(RichText::new(format!("Note: {note}")).color(p.muted));
+            ui.label(marked(ui, &format!("Note: {note}"), body_font(ui), p.muted));
         }
     }
 
@@ -937,23 +977,29 @@ impl App {
                                 ui.add(icon(mark, 16.0, color));
                                 ui.label(RichText::new(format!("{}.", i + 1)).color(p.muted));
                                 theme::neutral_chip(ui, &question.header);
-                                ui.label(
-                                    RichText::new(&question.question)
-                                        .font(theme::semibold(theme::TEXT_BODY))
-                                        .color(p.text_strong),
-                                );
+                                ui.label(marked(
+                                    ui,
+                                    &question.question,
+                                    theme::semibold(theme::TEXT_BODY),
+                                    p.text_strong,
+                                ));
                             });
                             ui.add_space(SPACE_XS);
                             match &question.answer {
                                 Some(answer) => {
-                                    ui.label(answer);
+                                    ui.label(marked(ui, answer, body_font(ui), p.text));
                                 }
                                 None => {
                                     ui.label(RichText::new("Unanswered").italics().color(p.warn));
                                 }
                             }
                             if let Some(note) = &question.answer_note {
-                                ui.label(RichText::new(format!("Note: {note}")).color(p.muted));
+                                ui.label(marked(
+                                    ui,
+                                    &format!("Note: {note}"),
+                                    body_font(ui),
+                                    p.muted,
+                                ));
                             }
                         },
                     )
@@ -977,7 +1023,7 @@ impl App {
     // ---- Keyboard -------------------------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context, round: &RoundView) {
-        if self.modal_open() {
+        if self.modal_open() || ctx.memory(|m| m.has_focus(filter_id())) {
             return;
         }
         let note_focused = match round.step {
@@ -1047,7 +1093,7 @@ impl App {
     /// the next widget on Tab, and clear focus on Esc before `shortcuts` can tell that
     /// Esc was meant for the Note rather than for cancelling the round.
     fn take_note_keys(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.modal_open() {
+        if self.modal_open() || ctx.memory(|m| m.has_focus(filter_id())) {
             return;
         }
         let Some(round) = self.desk.current().filter(|r| r.finished.is_none()) else {
@@ -1431,17 +1477,18 @@ fn option_card(
                         if index < 9 {
                             key_badge(ui, &(index + 1).to_string());
                         }
-                        ui.label(
-                            RichText::new(&option.label)
-                                .font(theme::semibold(theme::TEXT_BODY))
-                                .color(p.text_strong),
-                        );
+                        ui.label(marked(
+                            ui,
+                            &option.label,
+                            theme::semibold(theme::TEXT_BODY),
+                            p.text_strong,
+                        ));
                         if option.recommended {
                             theme::accent_chip(ui, "Recommended");
                         }
                     });
                     if !option.description.is_empty() {
-                        ui.label(RichText::new(&option.description).color(p.text));
+                        ui.label(marked(ui, &option.description, body_font(ui), p.text));
                     }
                 });
             });
@@ -1657,4 +1704,43 @@ fn age(since: SystemTime) -> String {
         60..3600 => format!("{} min ago", secs / 60),
         _ => format!("{} h ago", secs / 3600),
     }
+}
+
+fn filter_id() -> egui::Id {
+    egui::Id::unique("filter")
+}
+
+/// Where the frame's filter terms are kept for [`marked`].
+fn filter_terms_id() -> egui::Id {
+    egui::Id::unique("filter-terms")
+}
+
+fn body_font(ui: &egui::Ui) -> FontId {
+    egui::TextStyle::Body.resolve(ui.style())
+}
+
+/// `text` in `font` and `color`, with the hits of the filter terms highlighted.
+fn marked(ui: &egui::Ui, text: &str, font: FontId, color: Color32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let terms: Vec<String> = ui
+        .ctx()
+        .data(|d| d.get_temp(filter_terms_id()))
+        .unwrap_or_default();
+    let plain = TextFormat::simple(font.clone(), color);
+    let mut job = LayoutJob::default();
+    let mut at = 0;
+    for hit in crate::search::highlights(text, &terms) {
+        job.append(&text[at..hit.start], 0.0, plain.clone());
+        job.append(
+            &text[hit.clone()],
+            0.0,
+            TextFormat {
+                background: theme::tint(theme::of(ui).accent, 0.35),
+                ..plain.clone()
+            },
+        );
+        at = hit.end;
+    }
+    job.append(&text[at..], 0.0, plain);
+    job
 }

@@ -14,6 +14,7 @@ use tokio::sync::watch;
 use crate::{
     format::{Outcome, QuestionResult, RoundResult},
     schema::{AskInput, Question},
+    search,
     store::{self, DraftAnswer, Store, StoredRound},
 };
 
@@ -45,6 +46,8 @@ struct State {
     selected: Option<String>,
     /// Where rounds are persisted; `None` keeps them in memory only.
     store: Option<Store>,
+    /// The filter's terms; open rounds and History show only matching rounds.
+    filter: Vec<String>,
 }
 
 struct Round {
@@ -485,7 +488,11 @@ impl Desk {
     pub fn sessions(&self) -> Vec<SessionView> {
         let state = self.lock();
         let mut sessions: Vec<SessionView> = Vec::new();
-        for round in state.rounds.iter().filter(|r| r.is_open()) {
+        for round in state
+            .rounds
+            .iter()
+            .filter(|r| r.is_open() && r.matches(&state.filter))
+        {
             let summary = RoundSummary {
                 id: round.id.clone(),
                 ticket: round.ticket.clone(),
@@ -513,6 +520,7 @@ impl Desk {
         let mut history: Vec<HistoryEntry> = state
             .rounds
             .iter()
+            .filter(|r| r.matches(&state.filter))
             .filter_map(|round| {
                 Some(HistoryEntry {
                     id: round.id.clone(),
@@ -530,6 +538,17 @@ impl Desk {
             .collect();
         history.sort_by_key(|e| std::cmp::Reverse(e.finished_at));
         history
+    }
+
+    /// Filters open rounds and History to the rounds matching all whitespace-separated
+    /// terms of `query`, case-insensitively; an empty query shows all.
+    pub fn set_filter(&self, query: &str) {
+        self.lock().filter = search::terms(query);
+    }
+
+    /// The filter's terms, for highlighting the hits (see [`search::highlights`]).
+    pub fn filter_terms(&self) -> Vec<String> {
+        self.lock().filter.clone()
     }
 
     /// The selected round, open or finished, if any.
@@ -905,6 +924,31 @@ fn write_drafts_until_dropped(state: Weak<Mutex<State>>) {
 }
 
 impl Round {
+    /// Whether all `terms` occur in the round: its title, Agent Session and Ticket, its
+    /// Questions and Options, and the Notes. Previews are not searched.
+    fn matches(&self, terms: &[String]) -> bool {
+        if terms.is_empty() {
+            return true;
+        }
+        let meta = self
+            .title
+            .as_deref()
+            .into_iter()
+            .chain([self.session.as_str(), self.ticket.as_str()]);
+        let questions = self.questions.iter().flat_map(|q| {
+            [q.question.as_str(), q.header.as_str()]
+                .into_iter()
+                .chain(q.body.as_deref())
+                .chain(
+                    q.options
+                        .iter()
+                        .flat_map(|o| [o.label.as_str(), o.description.as_str()]),
+                )
+        });
+        let notes = self.answers.iter().map(|d| d.note.as_str());
+        search::matches(meta.chain(questions).chain(notes), terms)
+    }
+
     fn finish(&mut self, outcome: Outcome) {
         let result = self.result_for(outcome);
         self.result.send_replace(Some(result));
