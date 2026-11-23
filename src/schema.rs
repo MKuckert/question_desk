@@ -29,7 +29,7 @@ pub struct AskInput {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Question {
     /// The question text. Unique within the round; it keys the answer.
@@ -37,7 +37,7 @@ pub struct Question {
     /// Very short label shown as a chip, e.g. "Database".
     pub header: String,
     /// Optional Markdown with context, trade-offs and consequences.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     /// The choices. May be empty for open questions that only need free text.
     #[serde(default)]
@@ -46,11 +46,11 @@ pub struct Question {
     #[serde(default, rename = "multiSelect")]
     pub multi_select: bool,
     /// Your suggested answer: an Option label, or free text for a nuanced recommendation.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
     /// The choice as returned in the answer. Unique within the question.
@@ -58,7 +58,7 @@ pub struct QuestionOption {
     /// What this choice means and implies.
     pub description: String,
     /// Optional artifact to compare (code snippet, mockup), shown in monospace.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }
 

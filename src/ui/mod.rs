@@ -5,6 +5,7 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod macos_text_input;
 mod theme;
+mod time;
 
 use std::{
     net::IpAddr,
@@ -264,14 +265,18 @@ impl App {
         }
     }
 
+    /// With a store, open rounds survive the quit; without one, closing cancels them,
+    /// so the user confirms first.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.closing
-            && !self.desk.sessions().is_empty()
-        {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if !self.closing && !self.desk.is_persistent() && !self.desk.sessions().is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.dialog = Some(Dialog::Close);
+            return;
         }
+        self.desk.flush();
     }
 
     // ---- Chrome ---------------------------------------------------------------------------
@@ -311,6 +316,11 @@ impl App {
                             .color(p.text),
                     );
                 }
+                ui.label(
+                    RichText::new(format!("opened {}", time::clock(round.opened_at)))
+                        .size(theme::TEXT_SMALL)
+                        .color(p.muted),
+                );
                 if !round.connected {
                     ui.add(icon(icons::WARN, 16.0, p.warn));
                     ui.label(RichText::new("Agent disconnected").color(p.warn))

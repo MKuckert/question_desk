@@ -5,8 +5,8 @@
 //! HTTP types cross this interface.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
-    time::SystemTime,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+    time::{Duration, Instant, SystemTime},
 };
 
 use tokio::sync::watch;
@@ -14,7 +14,11 @@ use tokio::sync::watch;
 use crate::{
     format::{Outcome, QuestionResult, RoundResult},
     schema::{AskInput, Question},
+    store::{self, DraftAnswer, Store, StoredRound},
 };
+
+/// How long draft edits rest before they are written.
+const DRAFT_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Default)]
 pub struct Desk {
@@ -37,10 +41,16 @@ pub enum DeskEvent {
 struct State {
     /// In arrival order.
     rounds: Vec<Round>,
+    /// The id of the selected round.
     selected: Option<String>,
+    /// Where rounds are persisted; `None` keeps them in memory only.
+    store: Option<Store>,
 }
 
 struct Round {
+    /// Unique among all rounds, and the file name in the store: the Ticket, plus `@<n>`
+    /// when a later round reuses a released Ticket.
+    id: String,
     ticket: String,
     session: String,
     title: Option<String>,
@@ -51,8 +61,13 @@ struct Round {
     /// One clone per live [`Attachment`]; the count tells whether an Agent is waiting.
     attached: Arc<()>,
     opened_at: SystemTime,
+    finished_at: Option<SystemTime>,
+    /// When the result was first Delivered; `None` while open or Awaiting Pickup.
+    delivered_at: Option<SystemTime>,
     /// Whether the user has looked at the round yet.
     seen: bool,
+    /// Draft edits not written to the store yet, since this instant.
+    dirty_since: Option<Instant>,
 }
 
 /// What the user has entered for one Question so far.
@@ -78,6 +93,7 @@ pub struct SessionView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundSummary {
+    pub id: String,
     pub ticket: String,
     pub title: Option<String>,
     /// Whether any Agent call is currently waiting for this round's result.
@@ -92,12 +108,14 @@ pub struct RoundSummary {
 /// The selected round, as the UI shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundView {
+    pub id: String,
     pub ticket: String,
     pub session: String,
     pub title: Option<String>,
     pub step: Step,
     pub questions: Vec<QuestionView>,
     pub connected: bool,
+    pub opened_at: SystemTime,
 }
 
 impl RoundView {
@@ -190,6 +208,28 @@ impl Attachment {
 }
 
 impl Desk {
+    /// A desk that persists its rounds in `store`, starting with the rounds stored there.
+    pub fn with_store(store: Store) -> Self {
+        let desk = Desk::default();
+        desk.lock().attach_store(store);
+        let state = Arc::downgrade(&desk.state);
+        std::thread::Builder::new()
+            .name("draft-writer".into())
+            .spawn(move || write_drafts_until_dropped(state))
+            .expect("draft writer thread starts");
+        desk
+    }
+
+    /// Whether rounds are written to a store and so survive a quit.
+    pub fn is_persistent(&self) -> bool {
+        self.lock().store.is_some()
+    }
+
+    /// Writes all unsaved drafts, e.g. on quit.
+    pub fn flush(&self) {
+        self.lock().write_drafts(Duration::ZERO);
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("desk state is never poisoned")
     }
@@ -240,7 +280,9 @@ impl Desk {
         }
         let (result, _) = watch::channel(None);
         let session = session_label(client.as_deref(), input.source.as_deref());
+        let id = state.new_id(&input.ticket);
         state.rounds.push(Round {
+            id,
             ticket: input.ticket,
             session,
             title: input.title,
@@ -250,8 +292,13 @@ impl Desk {
             result,
             attached: Arc::new(()),
             opened_at: SystemTime::now(),
+            finished_at: None,
+            delivered_at: None,
             seen: false,
+            dirty_since: None,
         });
+        let last = state.rounds.len() - 1;
+        state.save(last);
         if state.selected_round().is_none() {
             state.select_first_open();
         }
@@ -276,6 +323,7 @@ impl Desk {
         let mut sessions: Vec<SessionView> = Vec::new();
         for round in state.rounds.iter().filter(|r| r.is_open()) {
             let summary = RoundSummary {
+                id: round.id.clone(),
                 ticket: round.ticket.clone(),
                 title: round.title.clone(),
                 connected: round.connected(),
@@ -347,24 +395,23 @@ impl Desk {
             })
             .collect();
         Some(RoundView {
+            id: round.id.clone(),
             ticket: round.ticket.clone(),
             session: round.session.clone(),
             title: round.title.clone(),
             step: round.step,
             questions,
             connected: round.connected(),
+            opened_at: round.opened_at,
         })
     }
 
-    pub fn select(&self, ticket: &str) {
+    /// Selects the round with this id (see [`RoundSummary::id`]).
+    pub fn select(&self, id: &str) {
         let mut state = self.lock();
-        if let Some(round) = state
-            .rounds
-            .iter_mut()
-            .find(|r| r.ticket == ticket && r.is_open())
-        {
+        if let Some(round) = state.rounds.iter_mut().find(|r| r.id == id && r.is_open()) {
             round.seen = true;
-            state.selected = Some(ticket.to_owned());
+            state.selected = Some(id.to_owned());
         }
     }
 
@@ -457,9 +504,12 @@ impl Desk {
     /// Cancels every open round, e.g. when the user closes the window.
     pub fn cancel_all(&self) {
         let mut state = self.lock();
-        for round in state.rounds.iter_mut().filter(|r| r.is_open()) {
-            let result = round.result_for(Outcome::Cancelled);
-            round.result.send_replace(Some(result));
+        let open: Vec<usize> = (0..state.rounds.len())
+            .filter(|&i| state.rounds[i].is_open())
+            .collect();
+        for i in open {
+            state.rounds[i].finish(Outcome::Cancelled);
+            state.save(i);
         }
         state.selected = None;
     }
@@ -467,17 +517,19 @@ impl Desk {
     /// Delivers the selected round's result and shows the next open round.
     fn finish(&self, outcome: Outcome) {
         let mut state = self.lock();
-        if let Some(round) = state.selected_round_mut() {
-            let result = round.result_for(outcome);
-            round.result.send_replace(Some(result));
+        if let Some(i) = state.selected_index() {
+            state.rounds[i].finish(outcome);
+            state.save(i);
             state.select_first_open();
         }
     }
 
+    /// Runs a draft edit on the selected open round; the store gets it debounced.
     fn with_selected(&self, f: impl FnOnce(&mut Round)) {
         let mut state = self.lock();
         if let Some(round) = state.selected_round_mut() {
             f(round);
+            round.dirty_since.get_or_insert_with(Instant::now);
         }
     }
 
@@ -495,26 +547,196 @@ impl State {
         let next = self.rounds.iter_mut().find(|r| r.is_open());
         self.selected = next.map(|round| {
             round.seen = true;
-            round.ticket.clone()
+            round.id.clone()
         });
     }
 
-    fn selected_round(&self) -> Option<&Round> {
+    fn selected_index(&self) -> Option<usize> {
         let selected = self.selected.as_ref()?;
         self.rounds
             .iter()
-            .find(|r| &r.ticket == selected && r.is_open())
+            .position(|r| &r.id == selected && r.is_open())
+    }
+
+    fn selected_round(&self) -> Option<&Round> {
+        self.selected_index().map(|i| &self.rounds[i])
     }
 
     fn selected_round_mut(&mut self) -> Option<&mut Round> {
-        let selected = self.selected.as_ref()?;
-        self.rounds
-            .iter_mut()
-            .find(|r| &r.ticket == selected && r.is_open())
+        self.selected_index().map(|i| &mut self.rounds[i])
+    }
+
+    /// An id for a new round with `ticket`, used by no round in memory and no file.
+    fn new_id(&self, ticket: &str) -> String {
+        let taken = |id: &str| {
+            self.rounds.iter().any(|r| r.id == id)
+                || self.store.as_ref().is_some_and(|s| s.exists(id))
+        };
+        if !taken(ticket) {
+            return ticket.to_owned();
+        }
+        (2..)
+            .map(|n| format!("{ticket}@{n}"))
+            .find(|id| !taken(id))
+            .expect("some suffix is free")
+    }
+
+    /// Makes `store` the place rounds are written to, and adds the rounds stored there.
+    fn attach_store(&mut self, store: Store) {
+        for stored in store.load().rounds {
+            if self.rounds.iter().any(|r| r.id == stored.id) {
+                continue;
+            }
+            self.rounds.push(Round::restore(stored));
+        }
+        self.rounds.sort_by_key(|r| r.opened_at);
+        self.store = Some(store);
+        if self.selected_round().is_none() {
+            self.select_first_open();
+        }
+    }
+
+    /// Writes round `i` to the store, if there is one.
+    fn save(&mut self, i: usize) {
+        let round = &mut self.rounds[i];
+        round.dirty_since = None;
+        if let Some(store) = &self.store
+            && let Err(e) = store.save(&round.to_stored())
+        {
+            log::error!("cannot save question round {:?}: {e}", round.id);
+        }
+    }
+
+    /// Writes the drafts that have rested for at least `delay`.
+    fn write_drafts(&mut self, delay: Duration) {
+        let due: Vec<usize> = (0..self.rounds.len())
+            .filter(|&i| {
+                self.rounds[i]
+                    .dirty_since
+                    .is_some_and(|since| since.elapsed() >= delay)
+            })
+            .collect();
+        for i in due {
+            self.save(i);
+        }
+    }
+}
+
+/// Writes rested drafts every quarter second, until the desk is gone.
+fn write_drafts_until_dropped(state: Weak<Mutex<State>>) {
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let Some(state) = state.upgrade() else { return };
+        state
+            .lock()
+            .expect("desk state is never poisoned")
+            .write_drafts(DRAFT_DELAY);
     }
 }
 
 impl Round {
+    fn finish(&mut self, outcome: Outcome) {
+        let result = self.result_for(outcome);
+        self.result.send_replace(Some(result));
+        self.finished_at = Some(SystemTime::now());
+    }
+
+    fn outcome(&self) -> Option<Outcome> {
+        self.result.borrow().as_ref().map(|r| r.outcome)
+    }
+
+    fn to_stored(&self) -> StoredRound {
+        StoredRound {
+            id: self.id.clone(),
+            ticket: self.ticket.clone(),
+            session: self.session.clone(),
+            title: self.title.clone(),
+            questions: self.questions.clone(),
+            answers: self
+                .questions
+                .iter()
+                .zip(&self.answers)
+                .map(|(question, draft)| DraftAnswer {
+                    selected: draft
+                        .selected
+                        .iter()
+                        .map(|&i| question.options[i].label.clone())
+                        .collect(),
+                    note: draft.note.clone(),
+                })
+                .collect(),
+            step: match self.step {
+                Step::Question(i) => Some(i),
+                Step::Review => None,
+            },
+            status: match self.outcome() {
+                None => store::Status::Open,
+                Some(Outcome::Submitted) => store::Status::Answered,
+                Some(Outcome::Cancelled) => store::Status::Cancelled,
+            },
+            opened_at: timestamp(self.opened_at),
+            finished_at: self.finished_at.map(timestamp),
+            delivered_at: self.delivered_at.map(timestamp),
+        }
+    }
+
+    /// A round as it was stored; nothing is attached to it yet.
+    fn restore(stored: StoredRound) -> Self {
+        let answers = stored
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(i, question)| {
+                let saved = stored.answers.get(i).cloned().unwrap_or_default();
+                let mut selected: Vec<usize> = question
+                    .options
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, o)| saved.selected.contains(&o.label))
+                    .map(|(j, _)| j)
+                    .collect();
+                if !question.multi_select {
+                    selected.truncate(1);
+                }
+                Draft {
+                    selected,
+                    note: saved.note,
+                }
+            })
+            .collect();
+        let step = match stored.step {
+            Some(i) if i < stored.questions.len() => Step::Question(i),
+            _ => Step::Review,
+        };
+        let mut round = Round {
+            id: stored.id,
+            ticket: stored.ticket,
+            session: stored.session,
+            title: stored.title,
+            questions: stored.questions,
+            answers,
+            step,
+            result: watch::channel(None).0,
+            attached: Arc::new(()),
+            opened_at: system_time(stored.opened_at),
+            finished_at: stored.finished_at.map(system_time),
+            delivered_at: stored.delivered_at.map(system_time),
+            seen: true,
+            dirty_since: None,
+        };
+        let outcome = match stored.status {
+            store::Status::Open => None,
+            store::Status::Answered => Some(Outcome::Submitted),
+            store::Status::Cancelled => Some(Outcome::Cancelled),
+        };
+        if let Some(outcome) = outcome {
+            let result = round.result_for(outcome);
+            round.result.send_replace(Some(result));
+            round.finished_at.get_or_insert(round.opened_at);
+        }
+        round
+    }
+
     fn connected(&self) -> bool {
         Arc::strong_count(&self.attached) > 1
     }
@@ -583,4 +805,13 @@ fn session_label(client: Option<&str>, source: Option<&str>) -> String {
         Some(source) => format!("{client} · {source}"),
         None => client.to_owned(),
     }
+}
+
+fn timestamp(time: SystemTime) -> jiff::Timestamp {
+    jiff::Timestamp::try_from(time).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+}
+
+fn system_time(timestamp: jiff::Timestamp) -> SystemTime {
+    let nanos = u64::try_from(timestamp.as_nanosecond()).unwrap_or(0);
+    SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos)
 }
