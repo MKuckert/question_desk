@@ -176,3 +176,71 @@ async fn delivery_survives_a_restart() {
         );
     requested(&h).await;
 }
+
+/// One `wait_for_answers` call that ends `pending` after the short pickup wait.
+async fn poll(
+    agent: &rmcp::service::RunningService<rmcp::RoleClient, Agent>,
+) -> rmcp::model::CallToolResult {
+    call(agent, "wait_for_answers", json!({ "ticket": "db-1" })).await
+}
+
+#[tokio::test]
+async fn a_decision_reaches_a_listed_agent_between_two_polls() {
+    let h = start().await;
+    let first = delivered(&h, db_round("db-1")).await;
+    let codex = h.agent_as(agent_named("codex", None)).await;
+    let pending = poll(&codex).await;
+    assert_eq!(
+        pending.structured_content.unwrap()["status"],
+        json!("pending")
+    );
+
+    // No call waits while the user decides.
+    let request = requested(&h).await;
+    h.desk.deliver_again(&request.id);
+    assert!(h.desk.redeliveries().is_empty());
+    assert_eq!(
+        poll(&codex).await.structured_content,
+        first.structured_content
+    );
+}
+
+#[tokio::test]
+async fn a_decision_without_a_waiting_call_is_not_given_to_another_agent() {
+    let h = start().await;
+    delivered(&h, db_round("db-1")).await;
+    let codex = h.agent_as(agent_named("codex", None)).await;
+    poll(&codex).await;
+    h.desk.deliver_again(&requested(&h).await.id);
+
+    let other = h.agent_as(agent_named("other", None)).await;
+    let pending = poll(&other).await;
+    assert_eq!(
+        pending.structured_content.unwrap()["status"],
+        json!("pending")
+    );
+    assert_eq!(requested(&h).await.requesters, vec!["other".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_decision_while_one_call_waits_also_answers_the_agent_still_polling() {
+    let h = start().await;
+    delivered(&h, db_round("db-1")).await;
+    let codex = h.agent_as(agent_named("codex", None)).await;
+    poll(&codex).await;
+    let asking = h.agent_as(agent_named("claude", None)).await;
+    let ask =
+        tokio::spawn(async move { call(&asking, "ask_user_question", db_round("db-1")).await });
+    for _ in 0..200 {
+        if requested(&h).await.requesters.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    h.desk.decline_redelivery(&requested(&h).await.id);
+    assert_eq!(ask.await.unwrap().is_error, Some(true));
+    let again = poll(&codex).await;
+    assert_eq!(again.is_error, Some(true), "declined, not a new request");
+    assert!(h.desk.redeliveries().is_empty());
+}

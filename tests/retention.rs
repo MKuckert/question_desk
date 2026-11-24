@@ -284,3 +284,164 @@ async fn a_delete_answers_a_pending_redelivery_request_with_a_decline() {
     h.desk.delete("db-1");
     assert_eq!(again.await.unwrap().is_error, Some(true));
 }
+
+fn persistence(h: &Harness, on: bool, data_dir: &Path) {
+    h.desk.apply_storage(StorageSettings {
+        persistence: on,
+        data_dir: Some(data_dir.to_owned()),
+    });
+}
+
+#[tokio::test]
+async fn a_new_data_dir_keeps_its_files_and_takes_rounds_under_free_names() {
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    let theirs = Store::new(new.path());
+    theirs.save(&stored("other", Some(1))).unwrap();
+    std::fs::write(theirs.path_of("db-1"), "{").unwrap();
+    let other = std::fs::read_to_string(theirs.path_of("other")).unwrap();
+
+    let h = start_in(old.path()).await;
+    let agent = h.agent().await;
+    let ask =
+        tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-1")).await });
+    h.select("db-1").await;
+    persistence(&h, true, new.path());
+
+    assert_eq!(
+        files(new.path()),
+        ["db-1.json", "db-1@2.json", "other.json"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(theirs.path_of("db-1")).unwrap(),
+        "{"
+    );
+    assert_eq!(
+        std::fs::read_to_string(theirs.path_of("other")).unwrap(),
+        other
+    );
+    assert!(history(&h).is_empty(), "rounds stored there are not loaded");
+
+    h.desk.toggle_option(0);
+    h.desk.submit();
+    assert_eq!(
+        ask.await.unwrap().structured_content.unwrap()["status"],
+        json!("answered")
+    );
+    let moved = std::fs::read_to_string(theirs.path_of("db-1@2")).unwrap();
+    assert!(moved.contains("\"delivered_at\""), "{moved}");
+    assert_eq!(
+        std::fs::read_to_string(theirs.path_of("db-1")).unwrap(),
+        "{"
+    );
+}
+
+#[tokio::test]
+async fn a_round_opened_while_saving_was_off_never_overwrites_a_skipped_file() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::new(data.path());
+    std::fs::create_dir_all(store.rounds_dir()).unwrap();
+    std::fs::write(store.path_of("db-1"), "{").unwrap();
+    let h = start_in(data.path()).await;
+    persistence(&h, false, data.path());
+
+    let agent = h.agent().await;
+    let _ask =
+        tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-1")).await });
+    h.select("db-1").await;
+    persistence(&h, true, data.path());
+
+    assert_eq!(files(data.path()), ["db-1.json", "db-1@2.json"]);
+    assert_eq!(std::fs::read_to_string(store.path_of("db-1")).unwrap(), "{");
+    assert_eq!(h.desk.current().unwrap().id, "db-1@2", "still selected");
+}
+
+#[tokio::test]
+async fn loading_at_startup_rewrites_no_file() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::new(data.path());
+    store.save(&stored("old", Some(1))).unwrap();
+    let pretty = std::fs::read_to_string(store.path_of("old")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+    let compact = serde_json::to_string(&value).unwrap();
+    std::fs::write(store.path_of("old"), &compact).unwrap();
+
+    // As at app startup (`main`).
+    let desk = question_desk::desk::Desk::new(StorageSettings {
+        persistence: true,
+        data_dir: Some(data.path().to_owned()),
+    });
+    let h = serve(desk, fast_settings()).await;
+    let config = data.path().join("config.toml");
+    write_config(&config, data.path(), "retention_days = 30");
+    housekeeping::run(&h.desk, &config).unwrap();
+    h.desk.flush();
+    assert_eq!(history(&h), ["old"]);
+    assert_eq!(
+        std::fs::read_to_string(store.path_of("old")).unwrap(),
+        compact
+    );
+}
+
+#[tokio::test]
+async fn a_round_deleted_while_saving_is_off_stays_deleted() {
+    let data = tempfile::tempdir().unwrap();
+    aged_store(data.path());
+    let h = start_in(data.path()).await;
+    persistence(&h, false, data.path());
+
+    h.desk.delete("recent");
+    assert!(!files(data.path()).contains(&"recent.json".to_owned()));
+    persistence(&h, true, data.path());
+    assert_eq!(history(&h), ["old"]);
+
+    h.desk.flush();
+    drop(h);
+    let h = start_in(data.path()).await;
+    assert_eq!(history(&h), ["old"]);
+}
+
+#[tokio::test]
+async fn a_delete_offer_deletes_nothing_once_saving_is_back_on() {
+    let data = tempfile::tempdir().unwrap();
+    aged_store(data.path());
+    let h = start_in(data.path()).await;
+    persistence(&h, false, data.path());
+    let offer = h.desk.take_delete_offer().unwrap();
+    assert!(h.desk.can_delete_stored(&offer));
+
+    let agent = h.agent().await;
+    let _ask =
+        tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-1")).await });
+    h.select("db-1").await;
+    persistence(&h, true, data.path());
+    assert!(!h.desk.can_delete_stored(&offer));
+
+    h.desk.delete_stored(&offer);
+    assert_eq!(
+        files(data.path()),
+        [
+            "broken.json",
+            "db-1.json",
+            "old.json",
+            "open.json",
+            "recent.json"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_delete_offer_deletes_only_the_files_it_counted() {
+    let data = tempfile::tempdir().unwrap();
+    aged_store(data.path());
+    let h = start_in(data.path()).await;
+    persistence(&h, false, data.path());
+    let offer = h.desk.take_delete_offer().unwrap();
+    // Written by hand (or another build) after the offer was made.
+    Store::new(data.path())
+        .save(&stored("later", Some(1)))
+        .unwrap();
+
+    h.desk.delete_stored(&offer);
+    assert_eq!(files(data.path()), ["broken.json", "later.json"]);
+}

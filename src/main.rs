@@ -7,13 +7,12 @@ fn main() -> eframe::Result {
         .init();
 
     let config = config::load();
-    let desk = Desk::default();
     // An unreadable config still stores rounds where they were by default.
     let storage = config.clone().unwrap_or_default().storage();
     if storage.persistence && storage.data_dir.is_none() {
         log::warn!("no home directory: question rounds are kept in memory only");
     }
-    desk.apply_storage(storage);
+    let desk = Desk::new(storage);
     // Prunes now and daily, re-reading the config each time.
     if let Some(path) = config::path() {
         housekeeping::spawn_daily(desk.clone(), path);

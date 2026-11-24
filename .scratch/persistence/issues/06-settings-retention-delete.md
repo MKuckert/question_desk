@@ -26,4 +26,6 @@ Spec: `../spec.md` (stories 14–18) · ADR 0007
 ## Comments
 
 - Implemented on branch `persistence`. New config keys `retention_days`, `data_dir` (absolute or `~/…`) and `persistence` can also be set in Settings, together with "Clear all History…". `src/housekeeping.rs` re-reads the config, applies the storage settings and prunes, at startup and then daily. On window focus the storage settings are re-read and applied, without pruning. Deleting a round or an Agent Session is in the context menu of a sidebar entry. Deleting a round with a pending Re-delivery Request declines the request.
-- Switching persistence on writes the rounds in memory to the folder and also loads the rounds already stored there.
+- Switching persistence on (or to a new `data_dir`) writes the rounds in memory to the folder; rounds already stored there are not loaded until the next start. A file there is never overwritten: a round whose file name is taken gets the next free `<ticket>@<n>` id. Deleting a round removes its file even while persistence is off. The delete offer only removes the files it counted, and nothing once its folder is in use again.
+- A Re-delivery decision answers the calls waiting at that moment, plus the Agents listed in the banner for 2 minutes (one polling `wait_for_answers` may be between calls). Anyone else, or later, raises a new request.
+- Handing a result to a call marks the round Delivered in the same locked step, so it cannot be reopened in between. File writes are queued under the desk lock and carried out after it is released.

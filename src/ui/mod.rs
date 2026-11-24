@@ -281,6 +281,12 @@ impl App {
             self.sidebar_open = true;
             ctx.memory_mut(|m| m.request_focus(filter_id()));
         }
+        if let Some(Dialog::DeleteStored(offer)) = &self.dialog
+            && !self.desk.can_delete_stored(offer)
+        {
+            // Persistence is back on for that folder: nothing to delete any more.
+            self.dialog = None;
+        }
         if self.dialog.is_none()
             && let Some(offer) = self.desk.take_delete_offer()
         {

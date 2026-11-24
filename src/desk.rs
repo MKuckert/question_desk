@@ -5,6 +5,8 @@
 //! HTTP types cross this interface.
 
 use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard, Weak},
     time::{Duration, Instant, SystemTime},
@@ -22,9 +24,15 @@ use crate::{
 /// How long draft edits rest before they are written.
 const DRAFT_DELAY: Duration = Duration::from_secs(1);
 
+/// How long a decided Re-delivery Request still answers the Agents it listed, e.g. one
+/// that polls `wait_for_answers` and was between two calls when the user decided.
+pub const REDELIVERY_GRACE: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Default)]
 pub struct Desk {
     state: Arc<Mutex<State>>,
+    /// Taken only while `state` is not held, so disk I/O never holds up the desk.
+    disk: Arc<Mutex<Disk>>,
     listener: Arc<Mutex<Option<Listener>>>,
 }
 
@@ -49,6 +57,11 @@ struct State {
     store: Option<Store>,
     /// The draft writer thread runs (it is started with the first store).
     writing_drafts: bool,
+    /// File writes decided under the lock, carried out once it is released (see
+    /// [`Locked`]).
+    jobs: Vec<Job>,
+    /// The sequence number of the last queued [`Job`].
+    last_job: u64,
     /// Stored rounds left behind when persistence was switched off, to offer deleting.
     delete_offer: Option<DeleteOffer>,
     /// The filter's terms; open rounds and History show only matching rounds.
@@ -78,6 +91,11 @@ struct Round {
     dirty_since: Option<Instant>,
     /// Agents asking for this Delivered round's result again; never persisted.
     redelivery: Option<Redelivery>,
+    /// The store holding this round's file, if it has one: where it was loaded from or
+    /// last written to. Only this file is ever overwritten or removed for the round.
+    stored_in: Option<Store>,
+    /// Changed since it was last written, e.g. while persistence was off.
+    unsaved: bool,
 }
 
 /// What the user has entered for one Question so far.
@@ -205,11 +223,10 @@ pub enum QuestionState {
 
 /// A call waiting for a round's result.
 pub struct Attachment {
-    /// The round's id.
-    round: String,
     ticket: String,
     wait: Wait,
-    /// Counts this call as connected; released on drop.
+    /// Counts this call as connected and identifies the round, whose id can change when
+    /// it moves to another data dir; released on drop. `None` for a Re-delivery Request.
     attached: Option<Arc<()>>,
     desk: Desk,
     title: Option<String>,
@@ -244,16 +261,26 @@ impl Attachment {
 
     /// Resolves when the user Submits or Cancels the round, or decides a Re-delivery
     /// Request; a declined request is an error message for the Agent.
+    ///
+    /// A result is handed over only together with marking the round Delivered, so the
+    /// round cannot be reopened after this returned it. Call it only when the result
+    /// goes into the response right away.
     pub async fn finished(&mut self) -> Result<RoundResult, String> {
         match &mut self.wait {
-            Wait::Result(result) => {
+            Wait::Result(result) => loop {
                 // A round is only deleted after it finished, so this sees its result.
-                let result = result
-                    .wait_for(Option::is_some)
-                    .await
-                    .map_err(|_| "the user deleted the question round".to_owned())?;
-                Ok(result.clone().expect("waited for a result"))
-            }
+                drop(
+                    result
+                        .wait_for(Option::is_some)
+                        .await
+                        .map_err(|_| "the user deleted the question round".to_owned())?,
+                );
+                let attached = self.attached.as_ref().expect("a result call is attached");
+                if let Some(result) = self.desk.hand_over(attached, result) {
+                    return Ok(result);
+                }
+                // Reopened in the meantime: wait for the re-submit.
+            },
             Wait::Redelivery { decision, result } => {
                 // A deleted round's request is declined.
                 let deliver = decision
@@ -269,19 +296,6 @@ impl Attachment {
                     ))
                 }
             }
-        }
-    }
-
-    /// Records that the result was written to the Agent's response: the round is
-    /// Delivered and its Ticket released.
-    pub fn delivered(&self) {
-        let mut state = self.desk.lock();
-        if let Some(i) = state.rounds.iter().position(|r| r.id == self.round)
-            && !state.rounds[i].is_open()
-            && state.rounds[i].delivered_at.is_none()
-        {
-            state.rounds[i].delivered_at = Some(SystemTime::now());
-            state.save(i);
         }
     }
 }
@@ -302,6 +316,102 @@ struct Redelivery {
     requesters: Vec<String>,
     /// `Some(true)` to deliver again, `Some(false)` to decline.
     decision: watch::Sender<Option<bool>>,
+    /// When the user decided; the decision answers the `requesters` for
+    /// [`REDELIVERY_GRACE`] after that, and anyone else gets a new request.
+    decided_at: Option<Instant>,
+}
+
+impl Redelivery {
+    /// Whether a call from `requester` gets this request's decision.
+    fn answers(&self, requester: &str) -> bool {
+        self.decided_at.is_none_or(|at| {
+            at.elapsed() < REDELIVERY_GRACE && self.requesters.iter().any(|r| r == requester)
+        })
+    }
+}
+
+/// A file operation on one round, decided under the state lock.
+struct Job {
+    /// Later jobs on the same file win, whichever thread gets to the disk first.
+    seq: u64,
+    store: Store,
+    id: String,
+    /// `None` removes the file.
+    write: Option<StoredRound>,
+}
+
+/// The sequence number of the last job carried out per file.
+#[derive(Default)]
+struct Disk {
+    done: HashMap<PathBuf, u64>,
+}
+
+impl Disk {
+    fn run(&mut self, jobs: Vec<Job>) {
+        for job in jobs {
+            let path = job.store.path_of(&job.id);
+            if self.done.get(&path).is_some_and(|&seq| seq > job.seq) {
+                continue;
+            }
+            let result = match &job.write {
+                Some(round) => job.store.save(round),
+                None => job.store.remove(&job.id),
+            };
+            if let Err(e) = result {
+                let action = if job.write.is_some() {
+                    "save"
+                } else {
+                    "delete"
+                };
+                log::error!("cannot {action} question round {:?}: {e}", job.id);
+            }
+            self.done.insert(path, job.seq);
+        }
+    }
+}
+
+/// The locked desk state. The file writes queued meanwhile run when it is released, so
+/// the UI, the draft writer and Agent calls never wait for the disk while holding it.
+struct Locked<'a> {
+    state: Option<MutexGuard<'a, State>>,
+    disk: &'a Mutex<Disk>,
+}
+
+impl<'a> Locked<'a> {
+    fn new(state: &'a Mutex<State>, disk: &'a Mutex<Disk>) -> Self {
+        Self {
+            state: Some(state.lock().expect("desk state is never poisoned")),
+            disk,
+        }
+    }
+}
+
+impl Deref for Locked<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.state.as_ref().expect("held until dropped")
+    }
+}
+
+impl DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.state.as_mut().expect("held until dropped")
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        let mut state = self.state.take().expect("held until dropped");
+        let jobs = std::mem::take(&mut state.jobs);
+        drop(state);
+        if !jobs.is_empty() {
+            self.disk
+                .lock()
+                .expect("disk lock is never poisoned")
+                .run(jobs);
+        }
+    }
 }
 
 /// Where and whether rounds are stored (see `config.toml`).
@@ -317,6 +427,8 @@ pub struct StorageSettings {
 pub struct DeleteOffer {
     pub data_dir: PathBuf,
     pub count: usize,
+    /// The ids of the files counted; only these are deleted.
+    ids: Vec<String>,
 }
 
 /// A pending Re-delivery Request, as the UI shows it.
@@ -332,10 +444,31 @@ pub struct RedeliveryView {
 }
 
 impl Desk {
+    /// The desk at startup: with persistence on, it holds the rounds stored in the data
+    /// dir and writes to it.
+    pub fn new(settings: StorageSettings) -> Self {
+        match settings.data_dir.filter(|_| settings.persistence) {
+            Some(dir) => Self::with_store(Store::new(dir)),
+            None => Self::default(),
+        }
+    }
+
     /// A desk that persists its rounds in `store`, starting with the rounds stored there.
+    /// Loading writes nothing.
     pub fn with_store(store: Store) -> Self {
+        let loaded = store.load();
         let desk = Desk::default();
-        desk.lock().attach_store(store);
+        {
+            let mut state = desk.lock();
+            for stored in loaded.rounds {
+                let mut round = Round::restore(stored);
+                round.stored_in = Some(store.clone());
+                state.rounds.push(round);
+            }
+            state.rounds.sort_by_key(|r| r.opened_at);
+            state.store = Some(store);
+            state.select_first_open();
+        }
         desk.start_draft_writer();
         desk
     }
@@ -346,17 +479,20 @@ impl Desk {
             return;
         }
         state.writing_drafts = true;
-        let state = Arc::downgrade(&self.state);
+        let weak = Arc::downgrade(&self.state);
+        let disk = self.disk.clone();
         std::thread::Builder::new()
             .name("draft-writer".into())
-            .spawn(move || write_drafts_until_dropped(state))
+            .spawn(move || write_drafts_until_dropped(weak, disk))
             .expect("draft writer thread starts");
     }
 
     /// Applies changed storage settings at once. Switching persistence off stops all
     /// writing and keeps the rounds in memory; the stored ones are offered for deletion
-    /// (see [`Desk::take_delete_offer`]). A new data dir gets all rounds in memory, plus
-    /// those already stored there; the old one is left untouched.
+    /// (see [`Desk::take_delete_offer`]). A new data dir gets the rounds in memory, and
+    /// the old one is left untouched. Rounds already stored in the new one are not
+    /// loaded, and its files are never overwritten: a round whose file name is taken
+    /// there is stored under a new id.
     pub fn apply_storage(&self, settings: StorageSettings) {
         let target = settings
             .data_dir
@@ -369,32 +505,38 @@ impl Desk {
         let previous = state.store.take();
         match target {
             None => {
+                drop(state);
                 if let Some(previous) = previous {
                     log::info!("persistence switched off");
-                    let count = previous.load().rounds.len();
-                    if !settings.persistence && count > 0 {
-                        state.delete_offer = Some(DeleteOffer {
-                            data_dir: previous.data_dir().to_owned(),
-                            count,
-                        });
+                    if !settings.persistence {
+                        self.offer_deleting(&previous);
                     }
                 }
             }
             Some(store) => {
                 log::info!("storing question rounds in {}", store.data_dir().display());
                 state.delete_offer = None;
-                state.attach_store(store);
-                for i in 0..state.rounds.len() {
-                    state.save(i);
-                }
+                state.store = Some(store.clone());
+                state.move_to(&store);
+                drop(state);
+                self.start_draft_writer();
             }
         }
-        let persistent = state.store.is_some();
-        drop(state);
-        if persistent {
-            self.start_draft_writer();
-        }
         self.notify(DeskEvent::Changed);
+    }
+
+    /// Offers deleting the rounds stored in `store`, unless persistence is back on.
+    fn offer_deleting(&self, store: &Store) {
+        // Read without holding the desk.
+        let ids: Vec<String> = store.load().rounds.into_iter().map(|r| r.id).collect();
+        let mut state = self.lock();
+        if !ids.is_empty() && state.store.is_none() {
+            state.delete_offer = Some(DeleteOffer {
+                data_dir: store.data_dir().to_owned(),
+                count: ids.len(),
+                ids,
+            });
+        }
     }
 
     /// The offer to delete stored rounds after persistence was switched off, once.
@@ -402,12 +544,38 @@ impl Desk {
         self.lock().delete_offer.take()
     }
 
-    /// Deletes the stored rounds of an accepted [`DeleteOffer`]; the rounds stay in
-    /// memory for this session.
+    /// Whether the offer still stands: its data dir is not in use again.
+    pub fn can_delete_stored(&self, offer: &DeleteOffer) -> bool {
+        self.lock()
+            .store
+            .as_ref()
+            .is_none_or(|s| s.data_dir() != offer.data_dir)
+    }
+
+    /// Deletes the stored rounds counted in an accepted [`DeleteOffer`]; the rounds stay
+    /// in memory for this session. Does nothing once the data dir is in use again.
     pub fn delete_stored(&self, offer: &DeleteOffer) {
-        let removed = Store::new(&offer.data_dir).remove_all();
+        if !self.can_delete_stored(offer) {
+            log::info!(
+                "not deleting the stored question rounds: {} is in use again",
+                offer.data_dir.display()
+            );
+            return;
+        }
+        let store = Store::new(&offer.data_dir);
+        let mut state = self.lock();
+        for id in &offer.ids {
+            state.queue(&store, id, None);
+        }
+        for round in &mut state.rounds {
+            if round.stored_in.as_ref() == Some(&store) && offer.ids.contains(&round.id) {
+                round.stored_in = None;
+                round.unsaved = true;
+            }
+        }
         log::info!(
-            "deleted {removed} stored question round(s) from {}",
+            "deleting {} stored question round(s) from {}",
+            offer.ids.len(),
             offer.data_dir.display()
         );
     }
@@ -442,8 +610,8 @@ impl Desk {
         self.delete_where(|r| ids.contains(&r.id));
     }
 
-    /// Deletes a round from memory and store; an open one is cancelled first, so its
-    /// Agent receives `cancelled`.
+    /// Deletes a round from memory and its file, even while persistence is off; an open
+    /// one is cancelled first, so its Agent receives `cancelled`.
     pub fn delete(&self, id: &str) {
         self.delete_where(|r| r.id == id);
     }
@@ -471,14 +639,14 @@ impl Desk {
             if round.is_open() {
                 round.finish(Outcome::Cancelled);
             }
-            if let Some(request) = round.redelivery.take() {
+            if let Some(request) = round.redelivery.take()
+                && request.decided_at.is_none()
+            {
                 request.decision.send_replace(Some(false));
             }
             let round = state.rounds.remove(i);
-            if let Some(store) = &state.store
-                && let Err(e) = store.remove(&round.id)
-            {
-                log::error!("cannot delete question round {:?}: {e}", round.id);
+            if let Some(store) = &round.stored_in {
+                state.queue(store, &round.id, None);
             }
             if state.selected.as_ref() == Some(&round.id) {
                 state.selected = None;
@@ -504,8 +672,33 @@ impl Desk {
         self.lock().write_drafts(Duration::ZERO);
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("desk state is never poisoned")
+    fn lock(&self) -> Locked<'_> {
+        Locked::new(&self.state, &self.disk)
+    }
+
+    /// Takes the result of the finished round `attached` belongs to and marks the round
+    /// Delivered, in one step: the user cannot reopen it in between. `None` if it was
+    /// reopened, so the call waits for the re-submit.
+    fn hand_over(
+        &self,
+        attached: &Arc<()>,
+        receiver: &watch::Receiver<Option<RoundResult>>,
+    ) -> Option<RoundResult> {
+        let mut state = self.lock();
+        let Some(i) = state
+            .rounds
+            .iter()
+            .position(|r| Arc::ptr_eq(&r.attached, attached))
+        else {
+            // Deleted after it finished (an open round is cancelled first).
+            return receiver.borrow().clone();
+        };
+        let result = state.rounds[i].result.borrow().clone()?;
+        if state.rounds[i].delivered_at.is_none() {
+            state.rounds[i].delivered_at = Some(SystemTime::now());
+            state.save(i);
+        }
+        Some(result)
     }
 
     /// Registers the one listener (the UI) for changes from the Agent side.
@@ -578,6 +771,8 @@ impl Desk {
             seen: false,
             dirty_since: None,
             redelivery: None,
+            stored_in: None,
+            unsaved: true,
         });
         let last = state.rounds.len() - 1;
         state.save(last);
@@ -611,7 +806,7 @@ impl Desk {
             .iter()
             .filter_map(|round| {
                 let request = round.redelivery.as_ref()?;
-                if request.decision.borrow().is_some() {
+                if request.decided_at.is_some() {
                     return None;
                 }
                 Some(RedeliveryView {
@@ -638,19 +833,19 @@ impl Desk {
         self.decide_redelivery(id, false);
     }
 
+    /// Answers the calls waiting now, and for [`REDELIVERY_GRACE`] the next calls of the
+    /// listed Agents (one polling `wait_for_answers` may be between two calls).
     fn decide_redelivery(&self, id: &str, deliver: bool) {
         let mut state = self.lock();
         let Some(round) = state.rounds.iter_mut().find(|r| r.id == id) else {
             return;
         };
-        let Some(request) = &round.redelivery else {
+        let Some(request) = &mut round.redelivery else {
             return;
         };
-        request.decision.send_replace(Some(deliver));
-        // With no call waiting right now (e.g. between two `wait_for_answers`), the
-        // decision is kept for the next one.
-        if request.decision.receiver_count() > 0 {
-            round.redelivery = None;
+        if request.decided_at.is_none() {
+            request.decision.send_replace(Some(deliver));
+            request.decided_at = Some(Instant::now());
         }
     }
 
@@ -1007,6 +1202,14 @@ impl State {
         desk: &Desk,
     ) -> (Attachment, DeskEvent) {
         let round = &mut self.rounds[i];
+        if round
+            .redelivery
+            .as_ref()
+            .is_some_and(|r| !r.answers(&requester))
+        {
+            // Decided too long ago, or without this Agent: the user is asked again.
+            round.redelivery = None;
+        }
         let event = if round.redelivery.is_some() {
             DeskEvent::Changed
         } else {
@@ -1015,23 +1218,18 @@ impl State {
         let request = round.redelivery.get_or_insert_with(|| Redelivery {
             requesters: Vec::new(),
             decision: watch::channel(None).0,
+            decided_at: None,
         });
-        let decided = request.decision.borrow().is_some();
-        if !decided && !request.requesters.contains(&requester) {
+        if request.decided_at.is_none() && !request.requesters.contains(&requester) {
             request.requesters.push(requester);
         }
         let decision = request.decision.subscribe();
-        if decided {
-            // A decision kept for the next call is used up by it.
-            round.redelivery = None;
-        }
         let result = round
             .result
             .borrow()
             .clone()
             .expect("a Delivered round is finished");
         let attachment = Attachment {
-            round: round.id.clone(),
             ticket: round.ticket.clone(),
             wait: Wait::Redelivery { decision, result },
             attached: None,
@@ -1057,30 +1255,57 @@ impl State {
             .expect("some suffix is free")
     }
 
-    /// Makes `store` the place rounds are written to, and adds the rounds stored there.
-    fn attach_store(&mut self, store: Store) {
-        for stored in store.load().rounds {
-            if self.rounds.iter().any(|r| r.id == stored.id) {
+    /// Writes the rounds to `store`, the new store: those it holds already only if they
+    /// changed, the others under an id whose file name is free there.
+    fn move_to(&mut self, store: &Store) {
+        for i in 0..self.rounds.len() {
+            let round = &self.rounds[i];
+            if round.stored_in.as_ref() == Some(store) {
+                if round.unsaved {
+                    self.save(i);
+                }
                 continue;
             }
-            self.rounds.push(Round::restore(stored));
-        }
-        self.rounds.sort_by_key(|r| r.opened_at);
-        self.store = Some(store);
-        if self.selected_round().is_none() {
-            self.select_first_open();
+            if store.exists(&round.id) {
+                // Another round's file, or one this build must not touch.
+                let id = self.new_id(&round.ticket.clone());
+                log::info!(
+                    "storing question round {:?} as {id:?}: its file name is taken in {}",
+                    self.rounds[i].id,
+                    store.data_dir().display()
+                );
+                if self.selected.as_ref() == Some(&self.rounds[i].id) {
+                    self.selected = Some(id.clone());
+                }
+                self.rounds[i].id = id;
+            }
+            self.save(i);
         }
     }
 
-    /// Writes round `i` to the store, if there is one.
+    /// Queues writing round `i` to the store, if there is one.
     fn save(&mut self, i: usize) {
         let round = &mut self.rounds[i];
         round.dirty_since = None;
-        if let Some(store) = &self.store
-            && let Err(e) = store.save(&round.to_stored())
-        {
-            log::error!("cannot save question round {:?}: {e}", round.id);
-        }
+        let Some(store) = self.store.clone() else {
+            round.unsaved = true;
+            return;
+        };
+        round.stored_in = Some(store.clone());
+        round.unsaved = false;
+        let (id, stored) = (round.id.clone(), round.to_stored());
+        self.queue(&store, &id, Some(stored));
+    }
+
+    /// Queues a write (`None`: removal) of the file of round `id` in `store`.
+    fn queue(&mut self, store: &Store, id: &str, write: Option<StoredRound>) {
+        self.last_job += 1;
+        self.jobs.push(Job {
+            seq: self.last_job,
+            store: store.clone(),
+            id: id.to_owned(),
+            write,
+        });
     }
 
     /// Writes the drafts that have rested for at least `delay`.
@@ -1099,14 +1324,11 @@ impl State {
 }
 
 /// Writes rested drafts every quarter second, until the desk is gone.
-fn write_drafts_until_dropped(state: Weak<Mutex<State>>) {
+fn write_drafts_until_dropped(state: Weak<Mutex<State>>, disk: Arc<Mutex<Disk>>) {
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let Some(state) = state.upgrade() else { return };
-        state
-            .lock()
-            .expect("desk state is never poisoned")
-            .write_drafts(DRAFT_DELAY);
+        Locked::new(&state, &disk).write_drafts(DRAFT_DELAY);
     }
 }
 
@@ -1225,6 +1447,8 @@ impl Round {
             seen: true,
             dirty_since: None,
             redelivery: None,
+            stored_in: None,
+            unsaved: false,
         };
         let outcome = match stored.status {
             store::Status::Open => None,
@@ -1253,7 +1477,6 @@ impl Round {
 
     fn attach(&self, desk: &Desk) -> Attachment {
         Attachment {
-            round: self.id.clone(),
             ticket: self.ticket.clone(),
             wait: Wait::Result(self.result.subscribe()),
             attached: Some(self.attached.clone()),
@@ -1317,4 +1540,35 @@ fn timestamp(time: SystemTime) -> jiff::Timestamp {
 fn system_time(timestamp: jiff::Timestamp) -> SystemTime {
     let nanos = u64::try_from(timestamp.as_nanosecond()).unwrap_or(0);
     SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_decision_expires_for_listed_agents_after_the_grace() {
+        let desk = Desk::default();
+        let input = crate::schema::parse_ask(serde_json::json!({
+            "ticket": "db-1",
+            "questions": [{ "question": "Which database?", "header": "Database" }]
+        }))
+        .unwrap();
+        let mut asked = desk.ask(input, Some("claude".into())).unwrap();
+        desk.submit();
+        asked.finished().await.unwrap();
+
+        drop(desk.pickup("db-1", Some("codex".into())).unwrap());
+        let id = desk.redeliveries()[0].id.clone();
+        desk.deliver_again(&id);
+        desk.lock().rounds[0]
+            .redelivery
+            .as_mut()
+            .unwrap()
+            .decided_at = Some(Instant::now() - REDELIVERY_GRACE);
+
+        let late = desk.pickup("db-1", Some("codex".into())).unwrap();
+        assert_eq!(desk.redeliveries().len(), 1, "asked again");
+        assert!(late.is_redelivery());
+    }
 }

@@ -217,19 +217,6 @@ impl Store {
         std::fs::rename(&temp, &path)
     }
 
-    /// Removes every readable round file and returns how many; unreadable and newer
-    /// files stay.
-    pub fn remove_all(&self) -> usize {
-        let mut removed = 0;
-        for round in self.load().rounds {
-            match self.remove(&round.id) {
-                Ok(()) => removed += 1,
-                Err(e) => log::error!("cannot delete question round {:?}: {e}", round.id),
-            }
-        }
-        removed
-    }
-
     /// Removes the file of `id`; a missing file is fine.
     pub fn remove(&self, id: &str) -> io::Result<()> {
         match std::fs::remove_file(self.path_of(id)) {

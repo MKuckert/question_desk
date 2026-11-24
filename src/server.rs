@@ -260,14 +260,11 @@ fn tool_error(message: impl Into<String>) -> CallToolResponse {
     CallToolResult::error(vec![ContentBlock::text(message.into())]).into()
 }
 
-/// The response for a finished wait: the result, which makes the round Delivered, or
-/// the error of a declined Re-delivery Request.
-fn deliver(attachment: &Attachment, outcome: Result<RoundResult, String>) -> CallToolResponse {
+/// The response for a finished wait: the result (the round is Delivered by now, see
+/// [`Attachment::finished`]), or the error of a declined Re-delivery Request.
+fn deliver(outcome: Result<RoundResult, String>) -> CallToolResponse {
     match outcome {
-        Ok(result) => {
-            attachment.delivered();
-            success(format::text(&result), format::structured(&result))
-        }
+        Ok(result) => success(format::text(&result), format::structured(&result)),
         Err(e) => tool_error(e),
     }
 }
@@ -324,7 +321,7 @@ impl Handler {
             Err(e) => return tool_error(e),
         };
         match self.wait(&mut attachment, None, &context).await {
-            Some(outcome) => deliver(&attachment, outcome),
+            Some(outcome) => deliver(outcome),
             None => tool_error("the call was cancelled; the round stays open for pickup"),
         }
     }
@@ -352,7 +349,7 @@ impl Handler {
             .wait(&mut attachment, Some(self.settings.pickup_wait), &context)
             .await
         {
-            Some(outcome) => deliver(&attachment, outcome),
+            Some(outcome) => deliver(outcome),
             None => {
                 let pending = if attachment.is_redelivery() {
                     format::pending_redelivery

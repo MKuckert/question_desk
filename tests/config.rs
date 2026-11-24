@@ -49,18 +49,21 @@ fn storage_settings_default_to_90_days_in_the_xdg_data_dir() {
     assert_eq!(config.data_dir(), question_desk::store::default_data_dir());
 }
 
+/// An absolute path on this platform: Windows paths need a drive.
+const ABSOLUTE: &str = if cfg!(windows) {
+    r"C:\srv\desk"
+} else {
+    "/srv/desk"
+};
+
 #[test]
 fn storage_settings_are_read() {
-    let config = config::parse(
-        r#"
-        retention_days = 0
-        data_dir = "/srv/desk"
-        persistence = false
-        "#,
-    )
+    let config = config::parse(&format!(
+        "retention_days = 0\ndata_dir = '{ABSOLUTE}'\npersistence = false\n"
+    ))
     .unwrap();
     assert_eq!(config.retention_days, 0);
-    assert_eq!(config.data_dir(), Some("/srv/desk".into()));
+    assert_eq!(config.data_dir(), Some(ABSOLUTE.into()));
     assert!(!config.persistence);
 }
 
@@ -105,7 +108,7 @@ fn the_written_file_reads_back() {
         port: 9000,
         bearer_token: Some("s3cret".into()),
         retention_days: 0,
-        data_dir: Some("/tmp/rounds".into()),
+        data_dir: Some(ABSOLUTE.into()),
         persistence: false,
     };
     let text = toml::to_string(&config).unwrap();
