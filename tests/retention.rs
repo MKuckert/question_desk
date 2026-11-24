@@ -395,7 +395,7 @@ async fn a_round_deleted_while_saving_is_off_stays_deleted() {
     persistence(&h, true, data.path());
     assert_eq!(history(&h), ["old"]);
 
-    h.desk.flush();
+    h.desk.close();
     drop(h);
     let h = start_in(data.path()).await;
     assert_eq!(history(&h), ["old"]);

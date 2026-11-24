@@ -34,6 +34,10 @@ while [[ "${1:-}" == "-o" || "${1:-}" == "-d" ]]; do
   esac
   shift 2
 done
+# The app ignores a relative XDG_DATA_HOME and would use the real data dir instead.
+if [[ -n "$DATA" && "$DATA" != /* ]]; then
+  DATA="$PWD/$DATA"
+fi
 
 WORK="$(mktemp -d)"
 DATA="${DATA:-$WORK/data}"

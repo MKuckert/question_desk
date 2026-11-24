@@ -8,9 +8,10 @@ use common::*;
 use question_desk::desk::Step;
 use serde_json::json;
 
-/// Quits the app: drafts are flushed, then desk and server go away.
+/// Quits the app: drafts are flushed and the data dir released, then desk and server go
+/// away.
 fn quit(h: Harness) {
-    h.desk.flush();
+    h.desk.close();
     drop(h);
 }
 
@@ -147,4 +148,59 @@ async fn corrupt_and_newer_files_are_skipped_and_left_untouched() {
     assert_eq!(std::fs::read_to_string(&newer).unwrap(), newer_text);
     let files = std::fs::read_dir(&rounds).unwrap().count();
     assert_eq!(files, 3, "the new round got a file of its own");
+}
+
+#[tokio::test]
+async fn a_failed_write_is_tried_again_until_it_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = start_in(dir.path()).await;
+    let agent = h.agent().await;
+    let _ask =
+        tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-1")).await });
+    h.select("db-1").await;
+    // A directory in the file's place makes the write fail.
+    let file = dir.path().join("rounds").join("db-1.json");
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    std::fs::write(file.join("blocker"), "").unwrap();
+    h.desk.set_note("draft");
+    h.desk.flush();
+    assert!(file.is_dir(), "the write failed");
+
+    std::fs::remove_dir_all(&file).unwrap();
+    h.desk.flush();
+    assert!(std::fs::read_to_string(&file).unwrap().contains("draft"));
+}
+
+#[tokio::test]
+async fn a_second_desk_on_the_same_data_dir_keeps_its_rounds_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = question_desk::desk::StorageSettings {
+        persistence: true,
+        data_dir: Some(dir.path().to_owned()),
+    };
+    let first = start_in(dir.path()).await;
+    let second = start_in(dir.path()).await;
+    assert!(!second.desk.is_persistent());
+    let unavailable = second.desk.take_storage_unavailable().unwrap();
+    assert_eq!(unavailable.data_dir, dir.path());
+
+    let agent = second.agent().await;
+    let _ask =
+        tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-1")).await });
+    second.select("db-1").await;
+    second.desk.flush();
+    let file = dir.path().join("rounds").join("db-1.json");
+    assert!(!file.exists(), "the second desk writes nothing");
+    second.desk.apply_storage(settings.clone());
+    assert!(
+        second.desk.take_storage_unavailable().is_none(),
+        "told once, not on every settings check"
+    );
+
+    // Once the first one quits, the next settings check takes the data dir.
+    first.desk.close();
+    second.desk.apply_storage(settings);
+    assert!(second.desk.is_persistent());
+    assert!(file.exists());
 }

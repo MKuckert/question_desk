@@ -165,7 +165,7 @@ async fn delivery_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let h = start_in(dir.path()).await;
     delivered(&h, db_round("db-1")).await;
-    h.desk.flush();
+    h.desk.close();
     drop(h);
 
     let h = start_in(dir.path()).await;
@@ -239,6 +239,25 @@ async fn a_decision_while_one_call_waits_also_answers_the_agent_still_polling() 
     }
 
     h.desk.decline_redelivery(&requested(&h).await.id);
+    assert_eq!(ask.await.unwrap().is_error, Some(true));
+    let again = poll(&codex).await;
+    assert_eq!(again.is_error, Some(true), "declined, not a new request");
+    assert!(h.desk.redeliveries().is_empty());
+}
+
+#[tokio::test]
+async fn a_decision_on_an_ask_with_a_source_answers_the_same_agents_poll() {
+    let h = start().await;
+    delivered(&h, db_round("db-1")).await;
+    let codex = std::sync::Arc::new(h.agent_as(agent_named("codex", None)).await);
+    let mut round = db_round("db-1");
+    round["source"] = json!("webshop");
+    let asking = codex.clone();
+    let ask = tokio::spawn(async move { call(&asking, "ask_user_question", round).await });
+    let request = requested(&h).await;
+    assert_eq!(request.requesters, vec!["codex · webshop".to_owned()]);
+
+    h.desk.decline_redelivery(&request.id);
     assert_eq!(ask.await.unwrap().is_error, Some(true));
     let again = poll(&codex).await;
     assert_eq!(again.is_error, Some(true), "declined, not a new request");

@@ -129,6 +129,29 @@ pub struct Loaded {
     pub skipped: Vec<(PathBuf, String)>,
 }
 
+/// Exclusive use of a data dir by this process (see [`Store::lock`]); released on drop,
+/// and by the OS when the process ends, crashed or not.
+#[derive(Debug)]
+pub struct StoreLock {
+    _file: std::fs::File,
+}
+
+#[derive(Debug)]
+pub enum LockError {
+    /// Another process, e.g. a second Question Desk, uses the data dir.
+    Taken,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Taken => write!(f, "another Question Desk uses it"),
+            LockError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// The round files under one data dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Store {
@@ -157,6 +180,23 @@ impl Store {
     /// Whether a file (readable or not) already uses this id.
     pub fn exists(&self, id: &str) -> bool {
         self.path_of(id).exists()
+    }
+
+    /// Takes the data dir for this process, so that no second Question Desk loads or
+    /// writes its rounds meanwhile. Taking it again in the same process fails as well.
+    pub fn lock(&self) -> Result<StoreLock, LockError> {
+        std::fs::create_dir_all(&self.data_dir).map_err(LockError::Io)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.data_dir.join("question-desk.lock"))
+            .map_err(LockError::Io)?;
+        match file.try_lock() {
+            Ok(()) => Ok(StoreLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(LockError::Taken),
+            Err(std::fs::TryLockError::Error(e)) => Err(LockError::Io(e)),
+        }
     }
 
     /// Reads every round file; a missing directory is an empty store.

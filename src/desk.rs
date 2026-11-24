@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -18,7 +18,7 @@ use crate::{
     format::{Outcome, QuestionResult, RoundResult},
     schema::{AskInput, Question},
     search,
-    store::{self, DraftAnswer, Store, StoredRound},
+    store::{self, DraftAnswer, Store, StoreLock, StoredRound},
 };
 
 /// How long draft edits rest before they are written.
@@ -31,8 +31,7 @@ pub const REDELIVERY_GRACE: Duration = Duration::from_secs(120);
 #[derive(Clone, Default)]
 pub struct Desk {
     state: Arc<Mutex<State>>,
-    /// Taken only while `state` is not held, so disk I/O never holds up the desk.
-    disk: Arc<Mutex<Disk>>,
+    disk: Arc<DiskQueue>,
     listener: Arc<Mutex<Option<Listener>>>,
 }
 
@@ -55,6 +54,13 @@ struct State {
     selected: Option<String>,
     /// Where rounds are persisted; `None` keeps them in memory only.
     store: Option<Store>,
+    /// Keeps other Question Desks out of `store` while it is ours.
+    store_lock: Option<StoreLock>,
+    /// The data dir persistence is configured for but cannot use, e.g. because another
+    /// Question Desk uses it; rounds stay in memory meanwhile.
+    unavailable: Option<StorageUnavailable>,
+    /// `unavailable` changed and the UI has not been told yet.
+    unavailable_untold: bool,
     /// The draft writer thread runs (it is started with the first store).
     writing_drafts: bool,
     /// File writes decided under the lock, carried out once it is released (see
@@ -312,8 +318,8 @@ enum Wait {
 
 /// Agents asking for a Delivered round's result again, answered by one decision.
 struct Redelivery {
-    /// Agent Session labels of the requesting calls, in order, without repeats.
-    requesters: Vec<String>,
+    /// The requesting calls, in order, one per Agent.
+    requesters: Vec<Requester>,
     /// `Some(true)` to deliver again, `Some(false)` to decline.
     decision: watch::Sender<Option<bool>>,
     /// When the user decided; the decision answers the `requesters` for
@@ -321,11 +327,29 @@ struct Redelivery {
     decided_at: Option<Instant>,
 }
 
+/// An Agent asking for a re-delivery.
+struct Requester {
+    /// Who asks, stable across `ask_user_question` and `wait_for_answers`: the client
+    /// name, as `wait_for_answers` carries no `source`.
+    agent: String,
+    /// The Agent Session label to show, with the `source` if the call had one.
+    label: String,
+}
+
+impl Requester {
+    fn new(client: Option<&str>, source: Option<&str>) -> Self {
+        Self {
+            agent: session_label(client, None),
+            label: session_label(client, source),
+        }
+    }
+}
+
 impl Redelivery {
-    /// Whether a call from `requester` gets this request's decision.
-    fn answers(&self, requester: &str) -> bool {
+    /// Whether a call from `agent` gets this request's decision.
+    fn answers(&self, agent: &str) -> bool {
         self.decided_at.is_none_or(|at| {
-            at.elapsed() < REDELIVERY_GRACE && self.requesters.iter().any(|r| r == requester)
+            at.elapsed() < REDELIVERY_GRACE && self.requesters.iter().any(|r| r.agent == agent)
         })
     }
 }
@@ -340,32 +364,110 @@ struct Job {
     write: Option<StoredRound>,
 }
 
-/// The sequence number of the last job carried out per file.
+/// How long a failed write rests before the draft writer tries it again.
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Carries out the [`Job`]s, and tells when all queued ones are done.
+#[derive(Default)]
+struct DiskQueue {
+    /// Taken only while `state` is not held, so disk I/O never holds up the desk.
+    disk: Mutex<Disk>,
+    /// Batches taken from the state but not carried out yet; counted up under the state
+    /// lock, so whoever takes it later sees them.
+    pending: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl DiskQueue {
+    /// Counts a batch as pending; call it while holding the state lock.
+    fn begin(&self) {
+        *self.pending.lock().expect("pending lock is never poisoned") += 1;
+    }
+
+    /// Carries out a batch counted by [`DiskQueue::begin`].
+    fn run(&self, jobs: Vec<Job>) {
+        self.disk
+            .lock()
+            .expect("disk lock is never poisoned")
+            .run(jobs);
+        let mut pending = self.pending.lock().expect("pending lock is never poisoned");
+        *pending -= 1;
+        if *pending == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    /// Waits until every batch counted so far is carried out.
+    fn wait_idle(&self) {
+        let pending = self.pending.lock().expect("pending lock is never poisoned");
+        drop(
+            self.idle
+                .wait_while(pending, |n| *n > 0)
+                .expect("pending lock is never poisoned"),
+        );
+    }
+
+    /// Tries the failed writes again, if they have rested for `delay`.
+    fn retry(&self, delay: Duration) {
+        self.disk
+            .lock()
+            .expect("disk lock is never poisoned")
+            .retry(delay);
+    }
+}
+
+/// The sequence number of the last job carried out per file, and the jobs that failed.
 #[derive(Default)]
 struct Disk {
     done: HashMap<PathBuf, u64>,
+    /// The latest failed job per file, until it or a later job on the file succeeds.
+    failed: HashMap<PathBuf, Job>,
+    /// When a job last failed.
+    failed_at: Option<Instant>,
 }
 
 impl Disk {
-    fn run(&mut self, jobs: Vec<Job>) {
-        for job in jobs {
+    fn run(&mut self, mut jobs: Vec<Job>) {
+        // Failed jobs go first: they are older than any new job on the same file.
+        let mut retries: Vec<Job> = self.failed.drain().map(|(_, job)| job).collect();
+        retries.sort_by_key(|job| job.seq);
+        retries.append(&mut jobs);
+        for job in retries {
             let path = job.store.path_of(&job.id);
-            if self.done.get(&path).is_some_and(|&seq| seq > job.seq) {
+            if self.done.get(&path).is_some_and(|&seq| seq > job.seq)
+                || self.failed.get(&path).is_some_and(|f| f.seq > job.seq)
+            {
                 continue;
             }
             let result = match &job.write {
                 Some(round) => job.store.save(round),
                 None => job.store.remove(&job.id),
             };
-            if let Err(e) = result {
-                let action = if job.write.is_some() {
-                    "save"
-                } else {
-                    "delete"
-                };
-                log::error!("cannot {action} question round {:?}: {e}", job.id);
+            match result {
+                Ok(()) => {
+                    self.failed.remove(&path);
+                    self.done.insert(path, job.seq);
+                }
+                Err(e) => {
+                    let action = if job.write.is_some() {
+                        "save"
+                    } else {
+                        "delete"
+                    };
+                    log::error!(
+                        "cannot {action} question round {:?}, trying again later: {e}",
+                        job.id
+                    );
+                    self.failed_at = Some(Instant::now());
+                    self.failed.insert(path, job);
+                }
             }
-            self.done.insert(path, job.seq);
+        }
+    }
+
+    fn retry(&mut self, delay: Duration) {
+        if !self.failed.is_empty() && self.failed_at.is_none_or(|at| at.elapsed() >= delay) {
+            self.run(Vec::new());
         }
     }
 }
@@ -374,11 +476,11 @@ impl Disk {
 /// the UI, the draft writer and Agent calls never wait for the disk while holding it.
 struct Locked<'a> {
     state: Option<MutexGuard<'a, State>>,
-    disk: &'a Mutex<Disk>,
+    disk: &'a DiskQueue,
 }
 
 impl<'a> Locked<'a> {
-    fn new(state: &'a Mutex<State>, disk: &'a Mutex<Disk>) -> Self {
+    fn new(state: &'a Mutex<State>, disk: &'a DiskQueue) -> Self {
         Self {
             state: Some(state.lock().expect("desk state is never poisoned")),
             disk,
@@ -404,13 +506,12 @@ impl Drop for Locked<'_> {
     fn drop(&mut self) {
         let mut state = self.state.take().expect("held until dropped");
         let jobs = std::mem::take(&mut state.jobs);
-        drop(state);
-        if !jobs.is_empty() {
-            self.disk
-                .lock()
-                .expect("disk lock is never poisoned")
-                .run(jobs);
+        if jobs.is_empty() {
+            return;
         }
+        self.disk.begin();
+        drop(state);
+        self.disk.run(jobs);
     }
 }
 
@@ -420,6 +521,14 @@ pub struct StorageSettings {
     pub persistence: bool,
     /// `None` when there is no data dir (no home directory): rounds stay in memory.
     pub data_dir: Option<PathBuf>,
+}
+
+/// Why rounds are kept in memory only although persistence is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageUnavailable {
+    pub data_dir: PathBuf,
+    /// E.g. "another Question Desk uses it".
+    pub reason: String,
 }
 
 /// The rounds still stored in `data_dir` after persistence was switched off.
@@ -454,10 +563,14 @@ impl Desk {
     }
 
     /// A desk that persists its rounds in `store`, starting with the rounds stored there.
-    /// Loading writes nothing.
+    /// Loading writes nothing. If another Question Desk uses `store`, the desk starts
+    /// empty and keeps its rounds in memory (see [`Desk::take_storage_unavailable`]).
     pub fn with_store(store: Store) -> Self {
-        let loaded = store.load();
         let desk = Desk::default();
+        if !desk.lock().claim(&store) {
+            return desk;
+        }
+        let loaded = store.load();
         {
             let mut state = desk.lock();
             for stored in loaded.rounds {
@@ -492,7 +605,8 @@ impl Desk {
     /// (see [`Desk::take_delete_offer`]). A new data dir gets the rounds in memory, and
     /// the old one is left untouched. Rounds already stored in the new one are not
     /// loaded, and its files are never overwritten: a round whose file name is taken
-    /// there is stored under a new id.
+    /// there is stored under a new id. A data dir another Question Desk uses is not
+    /// written; the next call tries again.
     pub fn apply_storage(&self, settings: StorageSettings) {
         let target = settings
             .data_dir
@@ -504,7 +618,16 @@ impl Desk {
         }
         let previous = state.store.take();
         match target {
+            Some(store) if !state.claim(&store) => {
+                state.store_lock = None;
+                drop(state);
+                if previous.is_some() {
+                    log::info!("persistence switched off");
+                }
+            }
             None => {
+                state.store_lock = None;
+                state.unavailable = None;
                 drop(state);
                 if let Some(previous) = previous {
                     log::info!("persistence switched off");
@@ -523,6 +646,16 @@ impl Desk {
             }
         }
         self.notify(DeskEvent::Changed);
+    }
+
+    /// Why rounds are kept in memory although persistence is on, once per data dir that
+    /// became unavailable.
+    pub fn take_storage_unavailable(&self) -> Option<StorageUnavailable> {
+        let mut state = self.lock();
+        if !std::mem::take(&mut state.unavailable_untold) {
+            return None;
+        }
+        state.unavailable.clone()
     }
 
     /// Offers deleting the rounds stored in `store`, unless persistence is back on.
@@ -546,24 +679,24 @@ impl Desk {
 
     /// Whether the offer still stands: its data dir is not in use again.
     pub fn can_delete_stored(&self, offer: &DeleteOffer) -> bool {
-        self.lock()
-            .store
-            .as_ref()
-            .is_none_or(|s| s.data_dir() != offer.data_dir)
+        self.lock().can_delete_stored(offer)
     }
 
     /// Deletes the stored rounds counted in an accepted [`DeleteOffer`]; the rounds stay
     /// in memory for this session. Does nothing once the data dir is in use again.
     pub fn delete_stored(&self, offer: &DeleteOffer) {
-        if !self.can_delete_stored(offer) {
+        let store = Store::new(&offer.data_dir);
+        // Held until the deletions are carried out (it is dropped after `state`): no
+        // Question Desk, this one included, starts using the data dir meanwhile.
+        let dir_lock = store.lock();
+        let mut state = self.lock();
+        if dir_lock.is_err() || !state.can_delete_stored(offer) {
             log::info!(
                 "not deleting the stored question rounds: {} is in use again",
                 offer.data_dir.display()
             );
             return;
         }
-        let store = Store::new(&offer.data_dir);
-        let mut state = self.lock();
         for id in &offer.ids {
             state.queue(&store, id, None);
         }
@@ -588,26 +721,15 @@ impl Desk {
             return;
         }
         let max_age = Duration::from_secs(u64::from(retention_days) * 24 * 60 * 60);
-        let ids: Vec<String> = {
-            let state = self.lock();
-            state
-                .rounds
-                .iter()
-                .filter(|r| {
-                    r.finished_at
-                        .is_some_and(|at| at.elapsed().is_ok_and(|age| age > max_age))
-                        && !r.is_open()
-                })
-                .map(|r| r.id.clone())
-                .collect()
-        };
-        if !ids.is_empty() {
-            log::info!(
-                "pruning {} question round(s) finished over {retention_days} days ago",
-                ids.len()
-            );
+        // Decided under the deleting lock: a round reopened meanwhile is not pruned.
+        let pruned = self.delete_where(|r| {
+            !r.is_open()
+                && r.finished_at
+                    .is_some_and(|at| at.elapsed().is_ok_and(|age| age > max_age))
+        });
+        if pruned > 0 {
+            log::info!("pruned {pruned} question round(s) finished over {retention_days} days ago");
         }
-        self.delete_where(|r| ids.contains(&r.id));
     }
 
     /// Deletes a round from memory and its file, even while persistence is off; an open
@@ -626,10 +748,11 @@ impl Desk {
         self.delete_where(|r| !r.is_open());
     }
 
-    fn delete_where(&self, doomed: impl Fn(&Round) -> bool) {
+    /// Deletes the rounds `doomed` picks, all under one lock; returns how many.
+    fn delete_where(&self, doomed: impl Fn(&Round) -> bool) -> usize {
         let mut state = self.lock();
         let mut i = 0;
-        let mut deleted = false;
+        let mut deleted = 0;
         while i < state.rounds.len() {
             if !doomed(&state.rounds[i]) {
                 i += 1;
@@ -651,15 +774,16 @@ impl Desk {
             if state.selected.as_ref() == Some(&round.id) {
                 state.selected = None;
             }
-            deleted = true;
+            deleted += 1;
         }
-        if deleted {
+        if deleted > 0 {
             if state.selected.is_none() {
                 state.select_first_open();
             }
             drop(state);
             self.notify(DeskEvent::Changed);
         }
+        deleted
     }
 
     /// Whether rounds are written to a store and so survive a quit.
@@ -667,9 +791,21 @@ impl Desk {
         self.lock().store.is_some()
     }
 
-    /// Writes all unsaved drafts, e.g. on quit.
+    /// Writes all unsaved drafts, e.g. on quit, and returns once every write queued so
+    /// far is done, failed ones tried once more.
     pub fn flush(&self) {
         self.lock().write_drafts(Duration::ZERO);
+        self.disk.wait_idle();
+        self.disk.retry(Duration::ZERO);
+    }
+
+    /// Writes everything like [`Desk::flush`], then stops storing and lets other Question
+    /// Desks use the data dir: the quit. The rounds stay in memory.
+    pub fn close(&self) {
+        self.flush();
+        let mut state = self.lock();
+        state.store = None;
+        state.store_lock = None;
     }
 
     fn lock(&self) -> Locked<'_> {
@@ -749,7 +885,8 @@ impl Desk {
                 return Ok((round.attach(self), DeskEvent::Changed));
             }
             if round.questions == input.questions {
-                return Ok(state.request_redelivery(i, session, self));
+                let requester = Requester::new(client.as_deref(), input.source.as_deref());
+                return Ok(state.request_redelivery(i, requester, self));
             }
             // Delivered with other Questions: the Ticket is free for a new round.
         }
@@ -791,7 +928,7 @@ impl Desk {
         if state.rounds[i].delivered_at.is_none() {
             return Some(state.rounds[i].attach(self));
         }
-        let requester = session_label(client.as_deref(), None);
+        let requester = Requester::new(client.as_deref(), None);
         let (attachment, event) = state.request_redelivery(i, requester, self);
         drop(state);
         self.notify(event);
@@ -816,7 +953,7 @@ impl Desk {
                         .title
                         .clone()
                         .unwrap_or_else(|| round.questions[0].question.clone()),
-                    requesters: request.requesters.clone(),
+                    requesters: request.requesters.iter().map(|r| r.label.clone()).collect(),
                     delivered_at: round.delivered_at.unwrap_or(round.opened_at),
                 })
             })
@@ -879,6 +1016,17 @@ impl Desk {
             }
         }
         sessions
+    }
+
+    /// Whether any round is open, filtered out or not.
+    pub fn has_open(&self) -> bool {
+        self.lock().rounds.iter().any(Round::is_open)
+    }
+
+    /// How many rounds are finished, filtered out or not: all that
+    /// [`Desk::clear_history`] deletes.
+    pub fn finished_count(&self) -> usize {
+        self.lock().rounds.iter().filter(|r| !r.is_open()).count()
     }
 
     /// Finished rounds, most recently finished first.
@@ -1158,6 +1306,39 @@ impl Desk {
 }
 
 impl State {
+    /// Takes `store`'s data dir for this desk; `false` (and remembered for the UI) if
+    /// another Question Desk uses it or it cannot be locked.
+    fn claim(&mut self, store: &Store) -> bool {
+        match store.lock() {
+            Ok(lock) => {
+                self.store_lock = Some(lock);
+                self.unavailable = None;
+                true
+            }
+            Err(e) => {
+                let unavailable = StorageUnavailable {
+                    data_dir: store.data_dir().to_owned(),
+                    reason: e.to_string(),
+                };
+                if self.unavailable.as_ref() != Some(&unavailable) {
+                    log::warn!(
+                        "keeping question rounds in memory only: cannot use {}: {e}",
+                        unavailable.data_dir.display()
+                    );
+                    self.unavailable = Some(unavailable);
+                    self.unavailable_untold = true;
+                }
+                false
+            }
+        }
+    }
+
+    fn can_delete_stored(&self, offer: &DeleteOffer) -> bool {
+        self.store
+            .as_ref()
+            .is_none_or(|s| s.data_dir() != offer.data_dir)
+    }
+
     fn select_first_open(&mut self) {
         let next = self.rounds.iter_mut().find(|r| r.is_open());
         self.selected = next.map(|round| {
@@ -1198,14 +1379,14 @@ impl State {
     fn request_redelivery(
         &mut self,
         i: usize,
-        requester: String,
+        requester: Requester,
         desk: &Desk,
     ) -> (Attachment, DeskEvent) {
         let round = &mut self.rounds[i];
         if round
             .redelivery
             .as_ref()
-            .is_some_and(|r| !r.answers(&requester))
+            .is_some_and(|r| !r.answers(&requester.agent))
         {
             // Decided too long ago, or without this Agent: the user is asked again.
             round.redelivery = None;
@@ -1220,7 +1401,12 @@ impl State {
             decision: watch::channel(None).0,
             decided_at: None,
         });
-        if request.decided_at.is_none() && !request.requesters.contains(&requester) {
+        if request.decided_at.is_none()
+            && !request
+                .requesters
+                .iter()
+                .any(|r| r.agent == requester.agent)
+        {
             request.requesters.push(requester);
         }
         let decision = request.decision.subscribe();
@@ -1323,12 +1509,14 @@ impl State {
     }
 }
 
-/// Writes rested drafts every quarter second, until the desk is gone.
-fn write_drafts_until_dropped(state: Weak<Mutex<State>>, disk: Arc<Mutex<Disk>>) {
+/// Writes rested drafts every quarter second, and tries failed writes again, until the
+/// desk is gone.
+fn write_drafts_until_dropped(state: Weak<Mutex<State>>, disk: Arc<DiskQueue>) {
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let Some(state) = state.upgrade() else { return };
         Locked::new(&state, &disk).write_drafts(DRAFT_DELAY);
+        disk.retry(RETRY_DELAY);
     }
 }
 

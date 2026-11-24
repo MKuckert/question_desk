@@ -292,6 +292,16 @@ impl App {
         {
             self.dialog = Some(Dialog::DeleteStored(offer));
         }
+        if self.notice.is_none()
+            && let Some(unavailable) = self.desk.take_storage_unavailable()
+        {
+            self.notice = Some(format!(
+                "Question rounds cannot be stored in {}: {}. This window keeps them in \
+                 memory only, so they are gone when you quit.",
+                home_relative(&unavailable.data_dir),
+                unavailable.reason
+            ));
+        }
         self.settings_dialog(&ctx);
         self.dialogs(&ctx, round.as_ref());
         self.notice_dialog(&ctx);
@@ -397,12 +407,12 @@ impl App {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        if !self.closing && !self.desk.is_persistent() && !self.desk.sessions().is_empty() {
+        if !self.closing && !self.desk.is_persistent() && self.desk.has_open() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.dialog = Some(Dialog::Close);
             return;
         }
-        self.desk.flush();
+        self.desk.close();
     }
 
     // ---- Chrome ---------------------------------------------------------------------------
@@ -581,13 +591,13 @@ impl App {
                 .hint_text(format!("Filter rounds ({}F)", cmd_symbol()))
                 .desired_width(f32::INFINITY),
         );
-        if response.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+        // egui drops the focus on Esc itself, so check the frame it was lost in too. The
+        // key is consumed: the shortcuts later this frame must not cancel the round.
+        if (response.has_focus() || response.lost_focus())
+            && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
             self.filter.clear();
             response.surrender_focus();
-        }
-        // egui drops the focus on Esc itself, so check the frame it was lost in too.
-        if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
-            self.filter.clear();
         }
         self.desk.set_filter(&self.filter);
     }
@@ -1302,7 +1312,7 @@ impl App {
                 format!(
                     "All {} finished round(s) are removed from this list and from disk. Open \
                      rounds stay.",
-                    self.desk.history().len()
+                    self.desk.finished_count()
                 ),
                 "Clear History",
             ),

@@ -43,7 +43,7 @@ pub async fn start_with(settings: ServerSettings) -> Harness {
 }
 
 /// A desk storing its rounds in `data_dir`. A "restart" is dropping the harness (after
-/// [`Desk::flush`], as on quit) and starting a new one on the same dir.
+/// [`Desk::close`], as on quit) and starting a new one on the same dir.
 pub async fn start_in(data_dir: &std::path::Path) -> Harness {
     serve(Desk::with_store(Store::new(data_dir)), fast_settings()).await
 }

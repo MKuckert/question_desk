@@ -103,3 +103,11 @@ async fn the_opened_round_marks_the_hits() {
         vec![5..9]
     );
 }
+
+#[tokio::test]
+async fn the_filter_hides_rounds_but_not_from_the_close_guard_or_clearing_history() {
+    let h = two_rounds().await;
+    assert!(shown(&h, "nothing-matches").is_empty());
+    assert!(h.desk.has_open(), "closing still asks before cancelling");
+    assert_eq!(h.desk.finished_count(), 1, "clearing History counts all");
+}

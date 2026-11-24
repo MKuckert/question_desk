@@ -17,7 +17,7 @@ The server cannot know whether an Agent *saw* a result: Claude Code backgrounds 
 - Writes are atomic (temp file + rename). Files are `0600`, the directory `0700`.
 - Files are written on round open, on Submit/Cancel and on Delivery. Drafts are written debounced (~1 s) and on quit.
 - All files are loaded at startup, and the load time is logged.
-- One store per OS user. There is no file lock; a second instance already fails to bind the port.
+- One store per OS user, used by one app instance at a time: the app holds an OS file lock on `<data_dir>/question-desk.lock` (released on quit or crash). A failed port bind does not stop a second instance, so a second instance finds the lock taken, keeps its rounds in memory only and tells the user; it takes the store once the first one quits.
 
 **Format evolution.** Each file carries a `version`; older versions are migrated in memory on load. Unparseable files and files from a newer version are skipped in place with a warning. They are never modified or pruned.
 
@@ -25,7 +25,7 @@ The server cannot know whether an Agent *saw* a result: Claude Code backgrounds 
 
 **Ticket release on Delivery.** A finished round is *Delivered* once its result was written to an HTTP response; this releases its Ticket. After that:
 - `ask_user_question` with the Ticket and **different** Questions opens a new round. The old one stays in History.
-- `ask_user_question` with the **same** Questions, or `wait_for_answers`, raises a **Re-delivery Request**: the user decides in the app whether to deliver the old result again or decline. While it is pending, the call blocks with Heartbeat, and `wait_for_answers` returns `pending`. Declining is a tool error telling the Agent to ask with a new Ticket or clarify with the user first. Re-delivery Requests are not persisted.
+- `ask_user_question` with the **same** Questions, or `wait_for_answers`, raises a **Re-delivery Request**: the user decides in the app whether to deliver the old result again or decline. While it is pending, the call blocks with Heartbeat, and `wait_for_answers` returns `pending`. Declining is a tool error telling the Agent to ask with a new Ticket or clarify with the user first. Re-delivery Requests are not persisted. A decision also answers the Agents that asked (by client name) for 2 minutes, so one polling `wait_for_answers` gets it between two calls. A request from another Agent in that time replaces it, and the earlier ones are asked again; we accept that rare repeat question.
 
 A finished round that was never delivered (*Awaiting Pickup*) keeps answering to its Ticket as before. The user can reopen it, which makes it open again: a Pickup then waits for the re-submit.
 
