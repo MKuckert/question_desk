@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Captures a screenshot of the Question Desk window, and only that window.
 #
-# Usage: tools/screenshot.sh [-o OUT.png] [DEMO_ROUND...]
+# Usage: tools/screenshot.sh [-o OUT.png] [-d DATA_DIR] [DEMO_ROUND...]
 #
 #   -o OUT.png    where to write the PNG (default: /tmp/question-desk-<time>.png)
+#   -d DATA_DIR   XDG data home for a started app; its rounds are in
+#                 DATA_DIR/question-desk/rounds/ (default: a fresh temp dir, so
+#                 screenshots never touch the user's History)
 #   DEMO_ROUND    arguments for `demo-client`, e.g. `all` or `grilling emoji`;
 #                 without them, the window shows whatever is open (or the empty state)
 #
@@ -20,15 +23,24 @@ URL="http://127.0.0.1:7457/mcp"
 OUT="/tmp/question-desk-$(date +%Y%m%d-%H%M%S).png"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
-if [[ "${1:-}" == "-o" ]]; then
-  OUT="$2"
+DATA=""
+while [[ "${1:-}" == "-o" || "${1:-}" == "-d" ]]; do
+  case "$1" in
+    -o) OUT="$2" ;;
+    -d) DATA="$2" ;;
+  esac
   shift 2
+done
+# The app ignores a relative XDG_DATA_HOME and would use the real data dir instead.
+if [[ -n "$DATA" && "$DATA" != /* ]]; then
+  DATA="$PWD/$DATA"
 fi
 
 WORK="$(mktemp -d)"
+DATA="${DATA:-$WORK/data}"
 PIDS=()
 cleanup() {
   for pid in ${PIDS[@]+"${PIDS[@]}"}; do kill "$pid" 2>/dev/null || true; done
@@ -58,7 +70,9 @@ if ! pgrep -f "target/release/question-desk" >/dev/null; then
     exit 1
   fi
   (cd "$ROOT" && cargo build --release --bins --quiet)
-  "$ROOT/target/release/question-desk" >"$WORK/app.log" 2>&1 &
+  # Fresh config and data dirs: the default port, and no rounds or `data_dir` of the user's.
+  XDG_CONFIG_HOME="$WORK/config" XDG_DATA_HOME="$DATA" \
+    "$ROOT/target/release/question-desk" >"$WORK/app.log" 2>&1 &
   PIDS+=($!)
   for _ in $(seq 1 100); do server_up && break; sleep 0.1; done
   server_up || { cat "$WORK/app.log" >&2; exit 1; }

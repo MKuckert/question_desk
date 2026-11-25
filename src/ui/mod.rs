@@ -5,6 +5,7 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod macos_text_input;
 mod theme;
+mod time;
 
 use std::{
     net::IpAddr,
@@ -24,9 +25,10 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use crate::{
     config::{self, Config},
     desk::{
-        Desk, DeskEvent, OptionView, QuestionState, QuestionView, RoundSummary, RoundView,
-        SessionView, Step,
+        Desk, DeskEvent, FinishedView, HistoryEntry, OptionView, QuestionState, QuestionView,
+        RedeliveryView, RoundSummary, RoundView, SessionView, Step, StorageSettings,
     },
+    format::Outcome,
     server::{DEFAULT_HOST, DEFAULT_PORT, ServerControl},
 };
 use grapheme::GraphemeText;
@@ -34,6 +36,10 @@ use icons::{button_icon, icon};
 use theme::{SPACE_L, SPACE_M, SPACE_S, SPACE_XS};
 
 const ZOOM_KEY: &str = "zoom_factor";
+/// Expands and collapses the History section.
+const HISTORY_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Y);
+/// Focuses the filter field.
+const FILTER_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 /// Below this width of the page the preview panel moves under the Options.
 const WIDE_LAYOUT: f32 = 720.0;
 /// The widest the page content gets.
@@ -92,11 +98,16 @@ pub fn run(
             Ok(Box::new(App {
                 desk,
                 server,
+                storage: config.storage(),
                 config,
                 status,
                 attention,
                 restore_window_level: false,
                 sidebar_open: true,
+                history_open: false,
+                filter: String::new(),
+                export: None,
+                notice: None,
                 dialog: None,
                 settings: None,
                 closing: false,
@@ -123,11 +134,18 @@ enum NoteFocus {
     Leave,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Dialog {
     Cancel,
     SubmitUnanswered,
     Close,
+    /// Quit although this many rounds could not be written to disk?
+    CloseUnsaved(usize),
+    /// Delete the round with this id.
+    DeleteRound(String),
+    /// Delete every round of the Agent Session with this label.
+    DeleteSession(String),
+    ClearHistory,
 }
 
 struct App {
@@ -135,6 +153,8 @@ struct App {
     server: ServerControl,
     /// The settings the server runs with.
     config: Config,
+    /// The storage settings the desk runs with: read at startup, applied by a restart.
+    storage: StorageSettings,
     /// Shown in the empty state: the MCP URL or why the server is not running.
     status: String,
     /// Set by the desk when a new round arrives.
@@ -142,6 +162,14 @@ struct App {
     /// The window was raised above others last frame and must go back to normal.
     restore_window_level: bool,
     sidebar_open: bool,
+    /// The History section is expanded; collapsed, only its header shows at the bottom.
+    history_open: bool,
+    /// The sidebar's filter query, as typed.
+    filter: String,
+    /// The id of the round to export after this frame.
+    export: Option<String>,
+    /// A message for the user, e.g. why an export failed, shown until dismissed.
+    notice: Option<String>,
     dialog: Option<Dialog>,
     /// The open settings dialog.
     settings: Option<SettingsForm>,
@@ -186,8 +214,14 @@ impl App {
         self.request_attention(&ctx);
         self.handle_close_request(&ctx);
 
+        let terms = self.desk.filter_terms();
+        ctx.data_mut(|d| d.insert_temp(filter_terms_id(), terms));
         let sessions = self.desk.sessions();
+        let redeliveries = self.desk.redeliveries();
+        let history = self.desk.history();
         let round = self.desk.current();
+        // Only an open round takes answers; a finished one is shown read-only.
+        let open_round = round.as_ref().filter(|r| r.finished.is_none());
 
         let p = theme::of(ui);
         let bar = Frame::new()
@@ -196,7 +230,7 @@ impl App {
         egui::Panel::top("top")
             .frame(bar)
             .show(ui, |ui| self.top_bar(ui, round.as_ref()));
-        if let Some(round) = &round {
+        if let Some(round) = open_round {
             egui::Panel::bottom("footer")
                 .frame(bar.inner_margin(Margin::symmetric(SPACE_L as i8, SPACE_M as i8)))
                 .show(ui, |ui| self.footer(ui, round));
@@ -208,7 +242,7 @@ impl App {
             .min_size(200.0)
             .frame(Frame::new().fill(p.panel).inner_margin(SPACE_M))
             .show_collapsible(ui, &mut sidebar_open, |ui| {
-                self.sidebar(ui, &sessions, round.as_ref())
+                self.sidebar(ui, &sessions, &redeliveries, &history, round.as_ref())
             });
         self.sidebar_open = sidebar_open;
         egui::CentralPanel::default()
@@ -220,26 +254,98 @@ impl App {
             .show(ui, |ui| {
                 page_column(ui, |ui| match &round {
                     None => self.empty_state(ui),
-                    Some(round) => match round.step {
-                        Step::Question(i) => self.question_page(ui, round, i),
-                        Step::Review => self.review_page(ui, round),
+                    Some(round) => match (&round.finished, round.step) {
+                        (Some(finished), _) => self.finished_page(ui, round, finished),
+                        (None, Step::Question(i)) => self.question_page(ui, round, i),
+                        (None, Step::Review) => self.review_page(ui, round),
                     },
                 })
             });
 
-        if let Some(round) = &round {
+        if let Some(round) = open_round {
             self.shortcuts(&ctx, round);
         }
         let settings = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
         if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&settings)) {
             self.open_settings();
         }
-        self.dialogs(&ctx, round.as_ref());
+        if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&HISTORY_SHORTCUT)) {
+            self.toggle_history();
+        }
+        if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&FILTER_SHORTCUT)) {
+            self.sidebar_open = true;
+            ctx.memory_mut(|m| m.request_focus(filter_id()));
+        }
+        if self.notice.is_none()
+            && let Some(unavailable) = self.desk.take_storage_unavailable()
+        {
+            self.notice = Some(format!(
+                "Question rounds cannot be stored in {}: {}. This window keeps them in \
+                 memory only, so they are gone when you quit.",
+                home_relative(&unavailable.data_dir),
+                unavailable.reason
+            ));
+        }
         self.settings_dialog(&ctx);
+        self.dialogs(&ctx, round.as_ref());
+        self.notice_dialog(&ctx);
+        if let Some(id) = self.export.take() {
+            self.export_round(&id);
+        }
+    }
+
+    /// Asks where to save the round and writes it there: JSON for a `.json` file name,
+    /// else Markdown.
+    fn export_round(&mut self, id: &str) {
+        let Some(round) = self.desk.export(id) else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export round")
+            .set_file_name(format!("{}.md", round.id))
+            .add_filter("Markdown", &["md"])
+            .add_filter("JSON", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let text = if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            crate::store::to_json(&round)
+        } else {
+            crate::export::markdown(&round, &jiff::tz::TimeZone::system())
+        };
+        if let Err(e) = std::fs::write(&path, text) {
+            log::error!("cannot export to {}: {e}", path.display());
+            self.notice = Some(format!(
+                "The round could not be exported to {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
+    fn notice_dialog(&mut self, ctx: &egui::Context) {
+        let Some(notice) = &self.notice else { return };
+        let style = ctx.global_style();
+        let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("notice"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(notice.as_str());
+                ui.add_space(SPACE_L);
+                close = ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+            });
+        if close || modal.should_close() {
+            self.notice = None;
+        }
     }
 
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.settings.is_some()
+        self.dialog.is_some() || self.settings.is_some() || self.notice.is_some()
     }
 
     /// On a new round: bring the window to the front and ask for attention (dock bounce,
@@ -264,14 +370,26 @@ impl App {
         }
     }
 
+    /// With a store, open rounds survive the quit; without one, closing cancels them,
+    /// so the user confirms first. Changes that cannot be written are confirmed, too.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.closing
-            && !self.desk.sessions().is_empty()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Some(Dialog::Close);
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
         }
+        if !self.closing {
+            let dialog = if !self.desk.is_persistent() {
+                self.desk.has_open().then_some(Dialog::Close)
+            } else {
+                let failed = self.desk.flush();
+                (failed > 0).then_some(Dialog::CloseUnsaved(failed))
+            };
+            if dialog.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.dialog = dialog;
+                return;
+            }
+        }
+        self.desk.close();
     }
 
     // ---- Chrome ---------------------------------------------------------------------------
@@ -311,7 +429,16 @@ impl App {
                             .color(p.text),
                     );
                 }
-                if !round.connected {
+                let mut times = format!("opened {}", time::clock(round.opened_at));
+                if let Some(finished) = &round.finished {
+                    times += &format!(
+                        " · {} {}",
+                        outcome_verb(finished.outcome),
+                        time::clock(finished.finished_at)
+                    );
+                }
+                ui.label(RichText::new(times).size(theme::TEXT_SMALL).color(p.muted));
+                if !round.connected && round.finished.is_none() {
                     ui.add(icon(icons::WARN, 16.0, p.warn));
                     ui.label(RichText::new("Agent disconnected").color(p.warn))
                         .on_hover_text(
@@ -334,7 +461,18 @@ impl App {
                     self.open_settings();
                 }
                 let Some(round) = round else { return };
+                if ui
+                    .add(egui::Button::new("Export round…").with_class(theme::GHOST))
+                    .on_hover_text("Save this round as Markdown or JSON")
+                    .clicked()
+                {
+                    self.export = Some(round.id.clone());
+                }
                 ui.add_space(SPACE_S);
+                if let Some(finished) = &round.finished {
+                    theme::neutral_chip(ui, outcome_label(finished.outcome));
+                    return;
+                }
                 match round.step {
                     Step::Question(i) => {
                         ui.label(
@@ -354,49 +492,202 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         sessions: &[SessionView],
+        redeliveries: &[RedeliveryView],
+        history: &[HistoryEntry],
         current: Option<&RoundView>,
     ) {
         let p = theme::of(ui);
+        self.filter_field(ui);
+        ui.add_space(SPACE_S);
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("OPEN ROUNDS")
                     .font(theme::semibold(theme::TEXT_SMALL))
                     .color(p.muted),
             );
-            let open: usize = sessions.iter().map(|s| s.rounds.len()).sum();
+            let open: usize =
+                sessions.iter().map(|s| s.rounds.len()).sum::<usize>() + redeliveries.len();
             if open > 0 {
                 theme::neutral_chip(ui, &open.to_string());
             }
         });
         ui.add_space(SPACE_XS);
-        ScrollArea::vertical().show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = SPACE_XS;
-            if sessions.is_empty() {
-                ui.label(RichText::new("Nothing waiting").color(p.muted));
+        // Collapsed, the History header sits at the bottom; expanded, it takes the lower half.
+        let history_header = 36.0;
+        let open_height = if self.history_open {
+            ui.available_height() * 0.5
+        } else {
+            ui.available_height() - history_header
+        };
+        ScrollArea::vertical()
+            .id_salt("open-rounds")
+            .auto_shrink([false, false])
+            .max_height(open_height.max(0.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = SPACE_XS;
+                if sessions.is_empty() && redeliveries.is_empty() {
+                    ui.label(RichText::new("Nothing waiting").color(p.muted));
+                }
+                for request in redeliveries {
+                    self.redelivery_banner(ui, request);
+                }
+                for session in sessions {
+                    ui.add_space(SPACE_S);
+                    ui.label(
+                        RichText::new(&session.label)
+                            .size(theme::TEXT_SMALL)
+                            .color(p.muted),
+                    );
+                    for round in &session.rounds {
+                        let selected = current.is_some_and(|c| c.id == round.id);
+                        let text = round_entry(ui, round, selected);
+                        let mut button = egui::Button::new(text);
+                        if round.new {
+                            button = button.right_text(new_badge(ui));
+                        }
+                        let button = button
+                            .selected(selected)
+                            .with_class(theme::NAV)
+                            .min_size(egui::vec2(ui.available_width(), 0.0));
+                        let response = ui.add(button);
+                        if response.clicked() {
+                            self.desk.select(&round.id);
+                        }
+                        self.round_menu(&response, &round.id, &session.label);
+                    }
+                }
+            });
+        self.history_section(ui, history, current);
+    }
+
+    /// Filters open rounds and History as the user types; Esc clears it.
+    fn filter_field(&mut self, ui: &mut egui::Ui) {
+        let response = ui.add(
+            TextEdit::singleline(&mut self.filter)
+                .id(filter_id())
+                .hint_text(format!("Filter rounds ({}F)", cmd_symbol()))
+                .desired_width(f32::INFINITY),
+        );
+        // egui drops the focus on Esc itself, so check the frame it was lost in too. The
+        // key is consumed: the shortcuts later this frame must not cancel the round.
+        if (response.has_focus() || response.lost_focus())
+            && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.filter.clear();
+            response.surrender_focus();
+        }
+        self.desk.set_filter(&self.filter);
+    }
+
+    /// The context menu of a round's sidebar entry.
+    fn round_menu(&mut self, response: &egui::Response, id: &str, session: &str) {
+        response.context_menu(|ui| {
+            if ui.button("Export round…").clicked() {
+                self.export = Some(id.to_owned());
             }
-            for session in sessions {
-                ui.add_space(SPACE_S);
-                ui.label(
-                    RichText::new(&session.label)
-                        .size(theme::TEXT_SMALL)
-                        .color(p.muted),
-                );
-                for round in &session.rounds {
-                    let selected = current.is_some_and(|c| c.ticket == round.ticket);
-                    let text = round_entry(ui, round, selected);
-                    let mut button = egui::Button::new(text);
-                    if round.new {
-                        button = button.right_text(new_badge(ui));
+            ui.separator();
+            if ui.button("Delete round…").clicked() {
+                self.dialog = Some(Dialog::DeleteRound(id.to_owned()));
+            }
+            if ui.button("Delete Agent Session…").clicked() {
+                self.dialog = Some(Dialog::DeleteSession(session.to_owned()));
+            }
+        });
+    }
+
+    fn toggle_history(&mut self) {
+        self.history_open = !self.history_open;
+    }
+
+    /// The History header, and the finished rounds below it when expanded.
+    fn history_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        history: &[HistoryEntry],
+        current: Option<&RoundView>,
+    ) {
+        let p = theme::of(ui);
+        ui.separator();
+        let arrow = if self.history_open { "▾" } else { "▸" };
+        let header = egui::Button::new(
+            RichText::new(format!("{arrow}  HISTORY"))
+                .font(theme::semibold(theme::TEXT_SMALL))
+                .color(p.muted),
+        )
+        .right_text(RichText::new(history.len().to_string()).color(p.muted))
+        .with_class(theme::NAV)
+        .min_size(egui::vec2(ui.available_width(), 0.0));
+        let tip = format!(
+            "{} History ({}Y)",
+            if self.history_open {
+                "Collapse"
+            } else {
+                "Expand"
+            },
+            cmd_symbol()
+        );
+        if ui.add(header).on_hover_text(tip).clicked() {
+            self.toggle_history();
+        }
+        if !self.history_open {
+            return;
+        }
+        ScrollArea::vertical()
+            .id_salt("history")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = SPACE_XS;
+                if history.is_empty() {
+                    ui.label(RichText::new("No finished rounds yet").color(p.muted));
+                }
+                for entry in history {
+                    let selected = current.is_some_and(|c| c.id == entry.id);
+                    let mut button = egui::Button::new(history_entry(ui, entry, selected));
+                    if entry.awaiting_pickup {
+                        button = button.right_text(badge(ui, "Awaiting Pickup", p.warn));
                     }
                     let button = button
                         .selected(selected)
                         .with_class(theme::NAV)
                         .min_size(egui::vec2(ui.available_width(), 0.0));
-                    if ui.add(button).clicked() {
-                        self.desk.select(&round.ticket);
+                    let response = ui.add(button);
+                    if response.clicked() {
+                        self.desk.select(&entry.id);
                     }
+                    self.round_menu(&response, &entry.id, &entry.session);
                 }
-            }
+            });
+    }
+
+    /// A Re-delivery Request: who wants which Delivered result again, and the decision.
+    fn redelivery_banner(&mut self, ui: &mut egui::Ui, request: &RedeliveryView) {
+        let p = theme::of(ui);
+        card_frame(theme::tint(p.warn, 0.12), Stroke::new(1.0, p.warn)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(icon(icons::WARN, 16.0, p.warn));
+                ui.label(
+                    RichText::new(format!(
+                        "{} wants to receive answers for “{}”, already delivered {}.",
+                        request.requesters.join(", "),
+                        request.title,
+                        time::when(request.delivered_at)
+                    ))
+                    .color(p.text_strong),
+                );
+            });
+            ui.add_space(SPACE_XS);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("Deliver again").with_class(theme::PRIMARY))
+                    .clicked()
+                {
+                    self.desk.deliver_again(&request.id);
+                }
+                if ui.button("Decline").clicked() {
+                    self.desk.decline_redelivery(&request.id);
+                }
+            });
         });
     }
 
@@ -485,11 +776,12 @@ impl App {
         ScrollArea::vertical()
             .id_salt(("page", &round.ticket, index))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(&question.question)
-                        .font(theme::semibold(theme::TEXT_TITLE))
-                        .color(p.text_strong),
-                );
+                ui.label(marked(
+                    ui,
+                    &question.question,
+                    theme::semibold(theme::TEXT_TITLE),
+                    p.text_strong,
+                ));
                 ui.add_space(SPACE_S);
                 if let Some(body) = &question.body {
                     card_frame(p.surface, Stroke::new(1.0, p.border)).show(ui, |ui| {
@@ -628,6 +920,135 @@ impl App {
         }
     }
 
+    // ---- Finished round -------------------------------------------------------------------
+
+    /// A finished round, read-only: every Question with all its Options, the chosen ones
+    /// marked, and the Notes.
+    fn finished_page(&mut self, ui: &mut egui::Ui, round: &RoundView, finished: &FinishedView) {
+        let p = theme::of(ui);
+        ui.horizontal_wrapped(|ui| {
+            let (mark, color) = match finished.outcome {
+                Outcome::Submitted => (icons::DONE, p.success),
+                Outcome::Cancelled => (icons::CLOSE, p.muted),
+            };
+            ui.add(icon(mark, 18.0, color));
+            ui.heading(format!(
+                "{} {}",
+                outcome_label(finished.outcome),
+                time::when(finished.finished_at)
+            ));
+        });
+        ui.add_space(SPACE_XS);
+        ui.horizontal_wrapped(|ui| match finished.delivered_at {
+            Some(delivered) => {
+                ui.label(
+                    RichText::new(format!("Delivered to the Agent {}.", time::when(delivered)))
+                        .color(p.muted),
+                );
+            }
+            None => {
+                theme::chip(ui, "Awaiting Pickup", p.on_accent, p.warn);
+                ui.label(RichText::new("No Agent has received these answers yet.").color(p.muted));
+                if finished.can_reopen
+                    && ui
+                        .add(egui::Button::new("Reopen and change answers"))
+                        .clicked()
+                {
+                    self.desk.reopen();
+                }
+            }
+        });
+        ui.add_space(SPACE_L);
+        ScrollArea::vertical()
+            .id_salt(("finished", &round.id))
+            .show(ui, |ui| {
+                for (i, question) in round.questions.iter().enumerate() {
+                    card_frame(p.surface, Stroke::new(1.0, p.border)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.finished_question(ui, round, question, i);
+                    });
+                    ui.add_space(SPACE_S);
+                }
+            });
+    }
+
+    fn finished_question(
+        &mut self,
+        ui: &mut egui::Ui,
+        round: &RoundView,
+        question: &QuestionView,
+        index: usize,
+    ) {
+        let p = theme::of(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{}.", index + 1)).color(p.muted));
+            theme::neutral_chip(ui, &question.header);
+            ui.label(marked(
+                ui,
+                &question.question,
+                theme::semibold(theme::TEXT_BODY),
+                p.text_strong,
+            ));
+        });
+        if let Some(body) = &question.body {
+            ui.add_space(SPACE_XS);
+            ui.push_id(("finished-body", &round.id, index), |ui| {
+                CommonMarkViewer::new().show(ui, &mut self.markdown, body);
+            });
+        }
+        ui.add_space(SPACE_S);
+        for option in &question.options {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SPACE_S;
+                selection_mark(ui, question.multi_select, option.selected);
+                let color = if option.selected {
+                    p.text_strong
+                } else {
+                    p.text
+                };
+                ui.label(marked(
+                    ui,
+                    &option.label,
+                    theme::semibold(theme::TEXT_BODY),
+                    color,
+                ));
+                if option.recommended {
+                    theme::accent_chip(ui, "Recommended");
+                }
+                if !option.description.is_empty() {
+                    ui.label(marked(ui, &option.description, body_font(ui), p.muted));
+                }
+            });
+        }
+        if question.options.is_empty()
+            || question.answer.is_none()
+            || question.answer_note.is_some()
+        {
+            ui.add_space(SPACE_XS);
+        }
+        match (
+            &question.answer,
+            question.options.iter().any(|o| o.selected),
+        ) {
+            (None, _) => {
+                ui.label(RichText::new("Unanswered").italics().color(p.warn));
+            }
+            // Without a selection, the Note is the Answer.
+            (Some(answer), false) => {
+                ui.label(marked(
+                    ui,
+                    &format!("Answer: {answer}"),
+                    body_font(ui),
+                    p.text,
+                ));
+            }
+            (Some(_), true) => {}
+        }
+        if let Some(note) = &question.answer_note {
+            ui.label(marked(ui, &format!("Note: {note}"), body_font(ui), p.muted));
+        }
+    }
+
     // ---- Review page ----------------------------------------------------------------------
 
     fn review_page(&mut self, ui: &mut egui::Ui, round: &RoundView) {
@@ -671,23 +1092,29 @@ impl App {
                                 ui.add(icon(mark, 16.0, color));
                                 ui.label(RichText::new(format!("{}.", i + 1)).color(p.muted));
                                 theme::neutral_chip(ui, &question.header);
-                                ui.label(
-                                    RichText::new(&question.question)
-                                        .font(theme::semibold(theme::TEXT_BODY))
-                                        .color(p.text_strong),
-                                );
+                                ui.label(marked(
+                                    ui,
+                                    &question.question,
+                                    theme::semibold(theme::TEXT_BODY),
+                                    p.text_strong,
+                                ));
                             });
                             ui.add_space(SPACE_XS);
                             match &question.answer {
                                 Some(answer) => {
-                                    ui.label(answer);
+                                    ui.label(marked(ui, answer, body_font(ui), p.text));
                                 }
                                 None => {
                                     ui.label(RichText::new("Unanswered").italics().color(p.warn));
                                 }
                             }
                             if let Some(note) = &question.answer_note {
-                                ui.label(RichText::new(format!("Note: {note}")).color(p.muted));
+                                ui.label(marked(
+                                    ui,
+                                    &format!("Note: {note}"),
+                                    body_font(ui),
+                                    p.muted,
+                                ));
                             }
                         },
                     )
@@ -711,7 +1138,7 @@ impl App {
     // ---- Keyboard -------------------------------------------------------------------------
 
     fn shortcuts(&mut self, ctx: &egui::Context, round: &RoundView) {
-        if self.modal_open() {
+        if self.modal_open() || ctx.memory(|m| m.has_focus(filter_id())) {
             return;
         }
         let note_focused = match round.step {
@@ -781,10 +1208,10 @@ impl App {
     /// the next widget on Tab, and clear focus on Esc before `shortcuts` can tell that
     /// Esc was meant for the Note rather than for cancelling the round.
     fn take_note_keys(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.modal_open() {
+        if self.modal_open() || ctx.memory(|m| m.has_focus(filter_id())) {
             return;
         }
-        let Some(round) = self.desk.current() else {
+        let Some(round) = self.desk.current().filter(|r| r.finished.is_none()) else {
             return;
         };
         let Step::Question(index) = round.step else {
@@ -806,8 +1233,10 @@ impl App {
     // ---- Dialogs --------------------------------------------------------------------------
 
     fn dialogs(&mut self, ctx: &egui::Context, round: Option<&RoundView>) {
-        let Some(dialog) = self.dialog else { return };
-        let (title, text, confirm) = match dialog {
+        let Some(dialog) = self.dialog.clone() else {
+            return;
+        };
+        let (title, text, confirm) = match &dialog {
             Dialog::Cancel => (
                 "Cancel this round?",
                 "The Agent receives the answers you gave so far, marked as cancelled.".to_owned(),
@@ -821,17 +1250,68 @@ impl App {
                 ),
                 "Submit anyway",
             ),
+            Dialog::CloseUnsaved(failed) => (
+                "Quit without saving?",
+                format!(
+                    "The latest changes to {failed} round(s) could not be written to disk, \
+                     e.g. because it is full; they are lost when you quit. Free up space \
+                     and close again to retry."
+                ),
+                "Quit anyway",
+            ),
             Dialog::Close => (
                 "Close the Question Desk?",
                 "All open rounds are cancelled; their Agents receive the answers given so far."
                     .to_owned(),
                 "Cancel rounds and quit",
             ),
+            Dialog::DeleteRound(id) => {
+                let round = self.desk.export(id);
+                let name = round
+                    .as_ref()
+                    .and_then(|r| r.title.clone())
+                    .map_or_else(|| "The round".to_owned(), |t| format!("“{t}”"));
+                let open = round.is_some_and(|r| r.status == crate::store::Status::Open);
+                (
+                    "Delete this round?",
+                    format!(
+                        "{name} is removed from this list and from disk.{}",
+                        if open {
+                            " It is still open: its Agent receives it as cancelled."
+                        } else {
+                            ""
+                        }
+                    ),
+                    "Delete round",
+                )
+            }
+            Dialog::DeleteSession(label) => (
+                "Delete this Agent Session?",
+                format!(
+                    "All rounds of “{label}”, open and finished, are removed from this list \
+                     and from disk. Open ones are cancelled first."
+                ),
+                "Delete all its rounds",
+            ),
+            Dialog::ClearHistory => (
+                "Clear all History?",
+                format!(
+                    "All {} finished round(s) are removed from this list and from disk. Open \
+                     rounds stay.",
+                    self.desk.finished_count()
+                ),
+                "Clear History",
+            ),
+        };
+        let dismiss = match &dialog {
+            Dialog::Cancel | Dialog::SubmitUnanswered | Dialog::Close => "Keep answering",
+            Dialog::CloseUnsaved(_) => "Keep open",
+            _ => "Cancel",
         };
         let mut decision = None;
         let confirm_class = match dialog {
             Dialog::SubmitUnanswered => theme::PRIMARY,
-            Dialog::Cancel | Dialog::Close => theme::DANGER,
+            _ => theme::DANGER,
         };
         let style = ctx.global_style();
         let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
@@ -850,7 +1330,7 @@ impl App {
                     {
                         decision = Some(true);
                     }
-                    if ui.button("Keep answering").clicked() {
+                    if ui.button(dismiss).clicked() {
                         decision = Some(false);
                     }
                 });
@@ -868,11 +1348,18 @@ impl App {
                 match dialog {
                     Dialog::Cancel => self.desk.cancel(),
                     Dialog::SubmitUnanswered => self.desk.submit(),
+                    Dialog::CloseUnsaved(_) => {
+                        self.closing = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                     Dialog::Close => {
                         self.desk.cancel_all();
                         self.closing = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    Dialog::DeleteRound(id) => self.desk.delete(&id),
+                    Dialog::DeleteSession(label) => self.desk.delete_session(&label),
+                    Dialog::ClearHistory => self.desk.clear_history(),
                 }
             }
             Some(false) => self.dialog = None,
@@ -891,6 +1378,9 @@ impl App {
             return;
         };
         let mut decision = None;
+        let mut clear_history = false;
+        // A confirmation on top of the settings gets the keys.
+        let confirming = self.dialog.is_some();
         let style = ctx.global_style();
         let frame = Frame::window(&style).inner_margin(theme::SPACE_L + theme::SPACE_S);
         let modal = egui::Modal::new(egui::Id::unique("settings"))
@@ -902,7 +1392,7 @@ impl App {
                 ui.add_space(SPACE_XS);
                 ui.label(
                     RichText::new(
-                        "Where Agents reach the MCP server. Saving restarts the server; \
+                        "Where Agents reach the MCP server. Changing it restarts the server; \
                          Agents already waiting for answers stay connected.",
                     )
                     .color(p.muted),
@@ -938,6 +1428,54 @@ impl App {
                         ui.checkbox(&mut form.show_token, "Show token");
                         ui.end_row();
                     });
+                ui.add_space(SPACE_L);
+                ui.label(
+                    RichText::new("STORED ROUNDS")
+                        .font(theme::semibold(theme::TEXT_SMALL))
+                        .color(p.muted),
+                );
+                ui.add_space(SPACE_XS);
+                ui.checkbox(
+                    &mut form.persistence,
+                    "Keep rounds on disk, so they survive a quit and form the History",
+                );
+                ui.add_space(SPACE_XS);
+                egui::Grid::new("storage-fields")
+                    .num_columns(2)
+                    .spacing([SPACE_M, SPACE_S])
+                    .show(ui, |ui| {
+                        ui.label("Keep for");
+                        ui.horizontal(|ui| {
+                            ui.add_enabled(
+                                form.persistence,
+                                TextEdit::singleline(&mut form.retention_days)
+                                    .hint_text(config::DEFAULT_RETENTION_DAYS.to_string())
+                                    .desired_width(56.0),
+                            );
+                            ui.label(
+                                RichText::new("days after finishing (0 = forever)").color(p.muted),
+                            );
+                        });
+                        ui.end_row();
+                        ui.label("Folder");
+                        let default = crate::store::default_data_dir()
+                            .map(|d| home_relative(&d))
+                            .unwrap_or_default();
+                        ui.add_enabled(
+                            form.persistence,
+                            TextEdit::singleline(&mut form.data_dir)
+                                .hint_text(default)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(SPACE_S);
+                if ui
+                    .add(egui::Button::new("Clear all History…").with_class(theme::DANGER))
+                    .clicked()
+                {
+                    clear_history = true;
+                }
                 let mut warnings = Vec::new();
                 if !is_loopback(&form.host) {
                     let mut warning = "Other machines can reach this address.".to_owned();
@@ -945,6 +1483,15 @@ impl App {
                         warning.push_str(" Set an access token.");
                     }
                     warnings.push(warning);
+                }
+                if form
+                    .config()
+                    .is_ok_and(|config| config.storage() != self.storage)
+                {
+                    warnings.push(
+                        "Stored rounds: restart Question Desk to use the changed settings."
+                            .to_owned(),
+                    );
                 }
                 warnings.extend(form.error.clone());
                 for warning in warnings {
@@ -974,11 +1521,14 @@ impl App {
                             .color(p.muted),
                     );
                 }
-                if ui.input(|i| i.key_pressed(Key::Enter)) {
+                if !confirming && ui.input(|i| i.key_pressed(Key::Enter)) {
                     decision = Some(true);
                 }
             });
-        if modal.should_close() && decision.is_none() {
+        if clear_history {
+            self.dialog = Some(Dialog::ClearHistory);
+        }
+        if modal.should_close() && decision.is_none() && !confirming {
             decision = Some(false);
         }
         let close = match decision {
@@ -1001,7 +1551,13 @@ impl App {
                 return false;
             }
         };
-        if config != self.config || !self.server.is_running() {
+        let server_changed = (&config.host, config.port, &config.bearer_token)
+            != (
+                &self.config.host,
+                self.config.port,
+                &self.config.bearer_token,
+            );
+        if server_changed || !self.server.is_running() {
             let result = self.server.restart(config.server_settings());
             if let Err(e) = result {
                 form.error = Some(e.clone());
@@ -1011,8 +1567,10 @@ impl App {
                 return false;
             }
             self.status = server_status(result);
-            self.config = config.clone();
         }
+        self.config = config.clone();
+        // Storage settings wait for the restart; the retention applies at once.
+        self.desk.prune(config.retention_days);
         match config::save(&config) {
             Ok(path) => {
                 log::info!("saved settings to {}", path.display());
@@ -1034,6 +1592,10 @@ struct SettingsForm {
     port: String,
     token: String,
     show_token: bool,
+    persistence: bool,
+    retention_days: String,
+    /// Empty for the default data dir.
+    data_dir: String,
     /// Why the last save failed.
     error: Option<String>,
 }
@@ -1045,6 +1607,13 @@ impl SettingsForm {
             port: config.port.to_string(),
             token: config.bearer_token.clone().unwrap_or_default(),
             show_token: false,
+            persistence: config.persistence,
+            retention_days: config.retention_days.to_string(),
+            data_dir: config
+                .data_dir
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default(),
             error: None,
         }
     }
@@ -1059,10 +1628,20 @@ impl SettingsForm {
             .filter(|&p| p != 0)
             .ok_or("The port must be a number between 1 and 65535.")?;
         let token = self.token.trim();
+        let retention_days = match self.retention_days.trim() {
+            "" => config::DEFAULT_RETENTION_DAYS,
+            days => days
+                .parse::<u32>()
+                .map_err(|_| "Keep for: the days must be a whole number, 0 for forever.")?,
+        };
+        let data_dir = self.data_dir.trim();
         let config = Config {
             host: self.host.trim().to_owned(),
             port,
             bearer_token: (!token.is_empty()).then(|| token.to_owned()),
+            retention_days,
+            data_dir: (!data_dir.is_empty()).then(|| data_dir.into()),
+            persistence: self.persistence,
         };
         config::validate(&config)?;
         Ok(config)
@@ -1165,17 +1744,18 @@ fn option_card(
                         if index < 9 {
                             key_badge(ui, &(index + 1).to_string());
                         }
-                        ui.label(
-                            RichText::new(&option.label)
-                                .font(theme::semibold(theme::TEXT_BODY))
-                                .color(p.text_strong),
-                        );
+                        ui.label(marked(
+                            ui,
+                            &option.label,
+                            theme::semibold(theme::TEXT_BODY),
+                            p.text_strong,
+                        ));
                         if option.recommended {
                             theme::accent_chip(ui, "Recommended");
                         }
                     });
                     if !option.description.is_empty() {
-                        ui.label(RichText::new(&option.description).color(p.text));
+                        ui.label(marked(ui, &option.description, body_font(ui), p.text));
                     }
                 });
             });
@@ -1311,18 +1891,64 @@ fn round_entry(ui: &egui::Ui, round: &RoundSummary, selected: bool) -> egui::tex
 
 /// The "New" badge of a round the user has not looked at, laid out inside its sidebar entry.
 fn new_badge(ui: &egui::Ui) -> egui::Atom<'static> {
+    badge(ui, "New", theme::of(ui).accent)
+}
+
+/// A filled badge with `text`, laid out inside a sidebar entry.
+fn badge(ui: &egui::Ui, text: &str, fill: Color32) -> egui::Atom<'static> {
     let p = theme::of(ui);
     let galley = ui.painter().layout_no_wrap(
-        "New".to_owned(),
+        text.to_owned(),
         theme::semibold(theme::TEXT_SMALL),
         p.on_accent,
     );
     let padding = egui::vec2(SPACE_S, 2.0);
     egui::Atom::paint(galley.size() + 2.0 * padding, move |ui, args| {
         let painter = ui.painter();
-        painter.rect_filled(args.rect, theme::RADIUS, p.accent);
+        painter.rect_filled(args.rect, theme::RADIUS, fill);
         painter.galley(args.rect.min + padding, galley.clone(), p.on_accent);
     })
+}
+
+/// A History entry: title, Agent Session, and when the round finished.
+fn history_entry(ui: &egui::Ui, entry: &HistoryEntry, selected: bool) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let p = theme::of(ui);
+    let mut job = LayoutJob::default();
+    let title_color = if selected { p.text_strong } else { p.text };
+    job.append(
+        entry.title.as_deref().unwrap_or(&entry.ticket),
+        0.0,
+        TextFormat::simple(theme::semibold(theme::TEXT_BUTTON), title_color),
+    );
+    job.append(
+        &format!(
+            "\n{}\n{} {} · {}/{} answered",
+            entry.session,
+            outcome_verb(entry.outcome),
+            time::clock(entry.finished_at),
+            entry.answered,
+            entry.total
+        ),
+        0.0,
+        TextFormat::simple(FontId::proportional(theme::TEXT_SMALL), p.muted),
+    );
+    job
+}
+
+/// "answered" or "cancelled", as in "answered 14:50".
+fn outcome_verb(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Submitted => "answered",
+        Outcome::Cancelled => "cancelled",
+    }
+}
+
+fn outcome_label(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Submitted => "Answered",
+        Outcome::Cancelled => "Cancelled",
+    }
 }
 
 fn note_id(ticket: &str, index: usize) -> egui::Id {
@@ -1345,4 +1971,43 @@ fn age(since: SystemTime) -> String {
         60..3600 => format!("{} min ago", secs / 60),
         _ => format!("{} h ago", secs / 3600),
     }
+}
+
+fn filter_id() -> egui::Id {
+    egui::Id::unique("filter")
+}
+
+/// Where the frame's filter terms are kept for [`marked`].
+fn filter_terms_id() -> egui::Id {
+    egui::Id::unique("filter-terms")
+}
+
+fn body_font(ui: &egui::Ui) -> FontId {
+    egui::TextStyle::Body.resolve(ui.style())
+}
+
+/// `text` in `font` and `color`, with the hits of the filter terms highlighted.
+fn marked(ui: &egui::Ui, text: &str, font: FontId, color: Color32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let terms: Vec<String> = ui
+        .ctx()
+        .data(|d| d.get_temp(filter_terms_id()))
+        .unwrap_or_default();
+    let plain = TextFormat::simple(font.clone(), color);
+    let mut job = LayoutJob::default();
+    let mut at = 0;
+    for hit in crate::search::highlights(text, &terms) {
+        job.append(&text[at..hit.start], 0.0, plain.clone());
+        job.append(
+            &text[hit.clone()],
+            0.0,
+            TextFormat {
+                background: theme::tint(theme::of(ui).accent, 0.35),
+                ..plain.clone()
+            },
+        );
+        at = hit.end;
+    }
+    job.append(&text[at..], 0.0, plain);
+    job
 }

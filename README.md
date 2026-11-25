@@ -44,6 +44,18 @@ bearer_token = "a-long-random-string"   # optional; clients must send it
 
 With `bearer_token` set, requests without `Authorization: Bearer <token>` get `401`. Requests carrying an `Origin` header always get `403`, so web pages cannot reach the port. If you listen on anything other than localhost, set a token.
 
+### Stored rounds and History
+
+Every question round, open or finished, is stored as one JSON file in `<data_dir>/rounds/` (owner-only permissions). Open rounds, your draft answers and results no Agent has picked up yet survive a quit or crash. Finished rounds form the **History** below the open rounds (`⌘Y` / `Ctrl+Y`): read-only, filterable (`⌘F` / `Ctrl+F`), exportable as Markdown or JSON, and deletable from the context menu of a round.
+
+```toml
+persistence = true          # default; false keeps rounds in memory only
+retention_days = 90         # default; finished rounds are deleted this long after finishing, 0 = forever
+data_dir = "~/rounds"       # default: ~/.local/share/question-desk ($XDG_DATA_HOME), Windows: the app data dir
+```
+
+`persistence` and `data_dir` take effect when Question Desk starts; after changing them, restart it (open rounds survive the restart when stored). `retention_days` applies at once: pruning runs at startup, once a day, and when you save Settings, re-reading `config.toml` first. Changing `data_dir` starts with the rounds stored in the new folder; the old one is left as it is. Only one Question Desk uses a `data_dir` at a time: a second one keeps its rounds in memory only and tells you so.
+
 ## Connect Claude Code
 
 1. Add the server (here for your user; use `--scope project` to share it via `.mcp.json`):

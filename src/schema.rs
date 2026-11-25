@@ -29,7 +29,7 @@ pub struct AskInput {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Question {
     /// The question text. Unique within the round; it keys the answer.
@@ -37,7 +37,7 @@ pub struct Question {
     /// Very short label shown as a chip, e.g. "Database".
     pub header: String,
     /// Optional Markdown with context, trade-offs and consequences.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     /// The choices. May be empty for open questions that only need free text.
     #[serde(default)]
@@ -46,11 +46,11 @@ pub struct Question {
     #[serde(default, rename = "multiSelect")]
     pub multi_select: bool,
     /// Your suggested answer: an Option label, or free text for a nuanced recommendation.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
     /// The choice as returned in the answer. Unique within the question.
@@ -58,7 +58,7 @@ pub struct QuestionOption {
     /// What this choice means and implies.
     pub description: String,
     /// Optional artifact to compare (code snippet, mockup), shown in monospace.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }
 
@@ -99,49 +99,55 @@ impl AskInput {
     /// Checks everything serde cannot; the message tells the Agent what to fix.
     pub fn validate(&self) -> Result<(), String> {
         validate_ticket(&self.ticket)?;
-        if self.questions.is_empty() {
-            return Err("`questions` must contain at least one question".into());
-        }
-        let mut texts = HashSet::new();
-        for (i, q) in self.questions.iter().enumerate() {
-            let at = format!("questions[{i}]");
-            if q.question.trim().is_empty() {
-                return Err(format!("`{at}.question` must not be empty"));
-            }
-            if !texts.insert(q.question.as_str()) {
-                return Err(format!(
-                    "`{at}.question` duplicates an earlier question ({:?}); question texts must be unique within a round because they key the answers",
-                    q.question
-                ));
-            }
-            if q.multi_select && q.options.is_empty() {
-                return Err(format!(
-                    "`{at}.multiSelect` is true but the question has no options; add options or drop `multiSelect`"
-                ));
-            }
-            if q.recommended
-                .as_deref()
-                .is_some_and(|r| r.trim().is_empty())
-            {
-                return Err(format!(
-                    "`{at}.recommended` must not be empty; omit it instead"
-                ));
-            }
-            let mut labels = HashSet::new();
-            for (j, o) in q.options.iter().enumerate() {
-                if o.label.trim().is_empty() {
-                    return Err(format!("`{at}.options[{j}].label` must not be empty"));
-                }
-                if !labels.insert(o.label.as_str()) {
-                    return Err(format!(
-                        "`{at}.options[{j}].label` duplicates an earlier option ({:?}); option labels must be unique within a question",
-                        o.label
-                    ));
-                }
-            }
-        }
-        Ok(())
+        validate_questions(&self.questions)
     }
+}
+
+/// Checks a round's Questions: at least one, with unique non-empty texts and unique
+/// non-empty Option labels. Stored rounds must pass this too: the desk relies on it.
+pub fn validate_questions(questions: &[Question]) -> Result<(), String> {
+    if questions.is_empty() {
+        return Err("`questions` must contain at least one question".into());
+    }
+    let mut texts = HashSet::new();
+    for (i, q) in questions.iter().enumerate() {
+        let at = format!("questions[{i}]");
+        if q.question.trim().is_empty() {
+            return Err(format!("`{at}.question` must not be empty"));
+        }
+        if !texts.insert(q.question.as_str()) {
+            return Err(format!(
+                "`{at}.question` duplicates an earlier question ({:?}); question texts must be unique within a round because they key the answers",
+                q.question
+            ));
+        }
+        if q.multi_select && q.options.is_empty() {
+            return Err(format!(
+                "`{at}.multiSelect` is true but the question has no options; add options or drop `multiSelect`"
+            ));
+        }
+        if q.recommended
+            .as_deref()
+            .is_some_and(|r| r.trim().is_empty())
+        {
+            return Err(format!(
+                "`{at}.recommended` must not be empty; omit it instead"
+            ));
+        }
+        let mut labels = HashSet::new();
+        for (j, o) in q.options.iter().enumerate() {
+            if o.label.trim().is_empty() {
+                return Err(format!("`{at}.options[{j}].label` must not be empty"));
+            }
+            if !labels.insert(o.label.as_str()) {
+                return Err(format!(
+                    "`{at}.options[{j}].label` duplicates an earlier option ({:?}); option labels must be unique within a question",
+                    o.label
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_ticket(ticket: &str) -> Result<(), String> {

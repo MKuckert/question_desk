@@ -14,3 +14,8 @@ Spec: `../spec.md` (story 13)
 
 - [ ] `insta` snapshots of the Markdown export: answered, cancelled, open with drafts, Unanswered, hostile Markdown, emoji.
 - [ ] JSON export equals the stored file.
+
+## Comments
+
+- Implemented on branch `persistence`: `src/export.rs` (Markdown, local times), `Desk::export` / `export_json`. "Export round…" is in the round header and in the context menu of every sidebar entry. The save dialog (rfd) has Markdown and JSON filters; a `.json` file name gets the JSON export.
+- The Markdown writer escapes heading numbers (`## 1\. …`) and indents quoted bodies (` > `). Both render as expected.

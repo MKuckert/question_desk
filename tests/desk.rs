@@ -1,174 +1,20 @@
 //! The primary seam: a headless Question Desk. The Agent side is driven by a real rmcp
 //! client over HTTP, the user side by the `desk` user intents.
 
-use std::{sync::Arc, time::Duration};
+mod common;
 
-use question_desk::{
-    desk::{Desk, QuestionState, RoundSummary, Step},
-    server::{self, RunningServer, ServerSettings},
-};
+use common::*;
+use question_desk::desk::{Desk, QuestionState, Step};
+use question_desk::server::ServerSettings;
 use rmcp::{
-    ClientHandler, RoleClient,
-    model::{
-        CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, Implementation,
-        ProgressNotificationParam, ProtocolVersion,
-    },
-    service::{ClientLifecycleMode, ClientServiceExt, NotificationContext, RunningService},
+    RoleClient,
+    model::ProtocolVersion,
+    service::{ClientLifecycleMode, ClientServiceExt, RunningService},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
-
-struct Harness {
-    desk: Desk,
-    server: RunningServer,
-}
-
-async fn start() -> Harness {
-    start_with(ServerSettings {
-        heartbeat: Duration::from_millis(50),
-        pickup_wait: Duration::from_millis(300),
-        ..ServerSettings::default()
-    })
-    .await
-}
-
-async fn start_with(settings: ServerSettings) -> Harness {
-    let desk = Desk::default();
-    let server = server::start(
-        desk.clone(),
-        ServerSettings {
-            port: 0,
-            ..settings
-        },
-    )
-    .await
-    .expect("server starts");
-    Harness { desk, server }
-}
-
-/// An Agent: records the Heartbeats it receives.
-#[derive(Clone, Default)]
-struct Agent {
-    client_info: Option<Implementation>,
-    progress: Arc<Mutex<Vec<ProgressNotificationParam>>>,
-}
-
-impl ClientHandler for Agent {
-    fn get_info(&self) -> ClientConfig {
-        ClientConfig::new(
-            ClientCapabilities::default(),
-            self.client_info
-                .clone()
-                .unwrap_or_else(|| Implementation::new("test-agent", "1.0")),
-        )
-    }
-
-    async fn on_progress(
-        &self,
-        params: ProgressNotificationParam,
-        _: NotificationContext<RoleClient>,
-    ) {
-        self.progress.lock().await.push(params);
-    }
-}
-
-impl Harness {
-    fn url(&self) -> String {
-        format!("http://{}/mcp", self.server.addr())
-    }
-
-    async fn agent(&self) -> RunningService<RoleClient, Agent> {
-        self.agent_as(Agent::default()).await
-    }
-
-    async fn agent_as(&self, agent: Agent) -> RunningService<RoleClient, Agent> {
-        Self::agent_at(&self.url(), agent).await
-    }
-
-    async fn agent_at(url: &str, agent: Agent) -> RunningService<RoleClient, Agent> {
-        // Like Claude Code: `server/discover` on protocol 2026-07-28, so the client's
-        // identity travels in each request's `_meta`.
-        let transport = StreamableHttpClientTransport::from_uri(url.to_owned());
-        let lifecycle = ClientLifecycleMode::Discover {
-            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-        };
-        agent
-            .serve_with_lifecycle(transport, lifecycle)
-            .await
-            .expect("agent connects")
-    }
-
-    /// Waits until the desk shows an open round with this Ticket, and selects it.
-    async fn select(&self, ticket: &str) {
-        self.appeared(ticket).await;
-        self.desk.select(ticket);
-    }
-
-    /// Waits until the desk shows an open round with this Ticket.
-    async fn appeared(&self, ticket: &str) -> RoundSummary {
-        for _ in 0..200 {
-            if let Some(round) = self
-                .desk
-                .sessions()
-                .into_iter()
-                .flat_map(|s| s.rounds)
-                .find(|r| r.ticket == ticket)
-            {
-                return round;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("round {ticket} never appeared on the desk");
-    }
-}
-
-async fn call(
-    agent: &RunningService<RoleClient, Agent>,
-    tool: &str,
-    args: Value,
-) -> CallToolResult {
-    let params = CallToolRequestParams::new(tool.to_owned())
-        .with_arguments(args.as_object().expect("arguments are an object").clone());
-    tokio::time::timeout(Duration::from_secs(10), agent.call_tool(params))
-        .await
-        .expect("tool call returns within 10 s")
-        .expect("tool call completes")
-}
-
-fn text(result: &CallToolResult) -> String {
-    result.content[0]
-        .as_text()
-        .expect("text content")
-        .text
-        .clone()
-}
-
-fn db_round(ticket: &str) -> Value {
-    json!({
-        "ticket": ticket,
-        "title": "Storage",
-        "questions": [
-            {
-                "question": "Which database?",
-                "header": "Database",
-                "body": "We need **transactions**.",
-                "options": [
-                    { "label": "Postgres", "description": "Relational, mature" },
-                    { "label": "SQLite", "description": "Embedded" }
-                ],
-                "recommended": "Postgres"
-            },
-            {
-                "question": "Anything else?",
-                "header": "Other"
-            }
-        ]
-    })
-}
-
 #[tokio::test]
 async fn the_user_answers_a_round_and_the_agent_receives_the_answers() {
     let h = start().await;
@@ -344,9 +190,6 @@ async fn repeating_the_call_with_the_same_ticket_reattaches_instead_of_asking_tw
     let (first, second) = (first.await.unwrap(), second.await.unwrap());
     assert_eq!(first, second);
     assert!(text(&first).contains(r#""Which database?"="Postgres""#));
-
-    let late = call(&h.agent().await, "ask_user_question", db_round("db-3")).await;
-    assert_eq!(late, first, "a finished round's result is delivered again");
 }
 
 #[tokio::test]
@@ -448,7 +291,7 @@ async fn an_unknown_ticket_is_a_tool_error() {
     assert_eq!(result.is_error, Some(true));
     assert_eq!(
         text(&result),
-        "unknown ticket \"nope\": no question round was asked with it since the Question Desk started"
+        "unknown ticket \"nope\": the Question Desk has no question round with this ticket"
     );
 }
 
@@ -507,17 +350,6 @@ async fn the_desk_shows_when_no_agent_is_waiting_for_a_round_any_more() {
         tokio::spawn(async move { call(&agent, "ask_user_question", db_round("db-8")).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(connected(&h), "reattaching connects the round again");
-}
-
-fn agent_named(name: &str, title: Option<&str>) -> Agent {
-    let mut info = Implementation::new(name, "1.0");
-    if let Some(title) = title {
-        info = info.with_title(title);
-    }
-    Agent {
-        client_info: Some(info),
-        ..Agent::default()
-    }
 }
 
 #[tokio::test]

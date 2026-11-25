@@ -78,6 +78,20 @@ pub fn pending(ticket: &str, title: Option<&str>, questions: &[String]) -> (Stri
     (text, output)
 }
 
+/// What `wait_for_answers` returns while the user has not decided a Re-delivery Request.
+pub fn pending_redelivery(
+    ticket: &str,
+    title: Option<&str>,
+    questions: &[String],
+) -> (String, Output) {
+    let (_, output) = pending(ticket, title, questions);
+    let text = format!(
+        "Still pending: the answers of question round {} were already delivered once, and the user has not decided yet whether to deliver them again. Call wait_for_answers again.",
+        quoted(ticket)
+    );
+    (text, output)
+}
+
 /// The text content of a finished round: one line for short Answers, Markdown blocks
 /// once any Answer or Note is long or spans several lines.
 pub fn text(result: &RoundResult) -> String {
@@ -150,7 +164,7 @@ fn paragraph(text: &str) -> Vec<Event<'static>> {
 
 /// `**label** text`, keeping the user's line breaks; the text is escaped by the writer.
 /// Blank lines start further paragraphs, so the text stays inside the section.
-fn labelled(label: &'static str, text: &str) -> Vec<Event<'static>> {
+pub(crate) fn labelled(label: &'static str, text: &str) -> Vec<Event<'static>> {
     let mut paragraphs: Vec<Vec<&str>> = vec![Vec::new()];
     for line in text.lines() {
         match paragraphs.last_mut() {

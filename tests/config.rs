@@ -35,8 +35,54 @@ fn host_port_and_token_are_read() {
             host: "0.0.0.0".into(),
             port: 8000,
             bearer_token: Some("s3cret".into()),
+            ..Config::default()
         }
     );
+}
+
+#[test]
+fn storage_settings_default_to_90_days_in_the_xdg_data_dir() {
+    let config = config::parse("").unwrap();
+    assert_eq!(config.retention_days, 90);
+    assert_eq!(config.data_dir, None);
+    assert!(config.persistence);
+    assert_eq!(config.data_dir(), question_desk::store::default_data_dir());
+}
+
+/// An absolute path on this platform: Windows paths need a drive.
+const ABSOLUTE: &str = if cfg!(windows) {
+    r"C:\srv\desk"
+} else {
+    "/srv/desk"
+};
+
+#[test]
+fn storage_settings_are_read() {
+    let config = config::parse(&format!(
+        "retention_days = 0\ndata_dir = '{ABSOLUTE}'\npersistence = false\n"
+    ))
+    .unwrap();
+    assert_eq!(config.retention_days, 0);
+    assert_eq!(config.data_dir(), Some(ABSOLUTE.into()));
+    assert!(!config.persistence);
+}
+
+#[test]
+fn a_data_dir_under_home_may_start_with_a_tilde() {
+    let config = config::parse(r#"data_dir = "~/rounds""#).unwrap();
+    let home = directories::BaseDirs::new().unwrap().home_dir().to_owned();
+    assert_eq!(config.data_dir(), Some(home.join("rounds")));
+}
+
+#[test]
+fn a_file_is_read_from_a_given_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    assert_eq!(config::load_from(&path).unwrap(), Config::default());
+    std::fs::write(&path, "retention_days = 7").unwrap();
+    assert_eq!(config::load_from(&path).unwrap().retention_days, 7);
+    std::fs::write(&path, "retention_days = -1").unwrap();
+    assert!(config::load_from(&path).is_err());
 }
 
 #[test]
@@ -47,6 +93,9 @@ fn invalid_settings_are_rejected() {
         r#"bearer_token = """#,
         r#"bearer_token = "two words""#,
         "unknown = 1",
+        r#"data_dir = """#,
+        r#"data_dir = "relative/dir""#,
+        "retention_days = -5",
     ] {
         assert!(config::parse(text).is_err(), "accepted {text}");
     }
@@ -58,6 +107,9 @@ fn the_written_file_reads_back() {
         host: "localhost".into(),
         port: 9000,
         bearer_token: Some("s3cret".into()),
+        retention_days: 0,
+        data_dir: Some(ABSOLUTE.into()),
+        persistence: false,
     };
     let text = toml::to_string(&config).unwrap();
     assert_eq!(config::parse(&text).unwrap(), config);

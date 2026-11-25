@@ -30,8 +30,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::{
-    desk::Attachment,
     desk::Desk,
+    desk::{Attachment, Client},
     format::{self, RoundResult},
     schema::{self, AskInput, Output, WaitInput},
 };
@@ -238,6 +238,12 @@ Tickets: `ticket` is required. Choose a short, unique id with a random suffix, e
 minutes. If the call is interrupted or times out, do not ask again with a new ticket: call \
 `wait_for_answers` with the same ticket (or repeat this exact call) to pick up the answers.
 
+Delivery: once the answers were sent to you, the round is delivered and its ticket is \
+released; a later call with that ticket and different questions opens a new round. Asking \
+for a delivered round's answers again (same questions, or `wait_for_answers`) needs the \
+user's confirmation: the call waits for it, and if the user declines it fails with an \
+error telling you to ask again with a new ticket.
+
 The result has the AskUserQuestion shape, plus `structuredContent` with `status` \
 (`answered` | `cancelled`), `answers`, `annotations` (the user's notes) and `unanswered`. \
 The user may leave questions unanswered or cancel; follow up on those instead of guessing.";
@@ -246,14 +252,21 @@ const WAIT_DESCRIPTION: &str = "\
 Pick up the answers of a question round by the ticket you chose in `ask_user_question`, \
 after that call was interrupted or timed out. Blocks up to about 50 seconds and returns the \
 answers, or status `pending` with the round's title and questions so you can confirm it is \
-yours; call it again while pending. An unknown ticket is an error.";
+yours; call it again while pending. An unknown ticket is an error. If the answers were \
+already delivered to you once, the user must confirm sending them again; until then the \
+status is `pending`, and a declined request is an error.";
 
 fn tool_error(message: impl Into<String>) -> CallToolResponse {
     CallToolResult::error(vec![ContentBlock::text(message.into())]).into()
 }
 
-fn finished(result: &RoundResult) -> CallToolResponse {
-    success(format::text(result), format::structured(result))
+/// The response for a finished wait: the result (the round is Delivered by now, see
+/// [`Attachment::finished`]), or the error of a declined Re-delivery Request.
+fn deliver(outcome: Result<RoundResult, String>) -> CallToolResponse {
+    match outcome {
+        Ok(result) => success(format::text(&result), format::structured(&result)),
+        Err(e) => tool_error(e),
+    }
 }
 
 fn success(text: String, output: Output) -> CallToolResponse {
@@ -299,16 +312,16 @@ impl Handler {
         };
         // Only the per-request `_meta` identifies the client; in stateless mode the peer
         // info is a placeholder (ADR 0001).
-        let client = context
-            .meta
-            .client_info()
-            .map(|c| c.title.unwrap_or(c.name));
+        let client = context.meta.client_info().map(|c| Client {
+            name: c.name,
+            title: c.title,
+        });
         let mut attachment = match self.desk.ask(input, client) {
             Ok(attachment) => attachment,
             Err(e) => return tool_error(e),
         };
         match self.wait(&mut attachment, None, &context).await {
-            Some(result) => finished(&result),
+            Some(outcome) => deliver(outcome),
             None => tool_error("the call was cancelled; the round stays open for pickup"),
         }
     }
@@ -322,9 +335,13 @@ impl Handler {
             Ok(input) => input,
             Err(e) => return tool_error(e),
         };
-        let Some(mut attachment) = self.desk.pickup(&input.ticket) else {
+        let client = context.meta.client_info().map(|c| Client {
+            name: c.name,
+            title: c.title,
+        });
+        let Some(mut attachment) = self.desk.pickup(&input.ticket, client) else {
             return tool_error(format!(
-                "unknown ticket {:?}: no question round was asked with it since the Question Desk started",
+                "unknown ticket {:?}: the Question Desk has no question round with this ticket",
                 input.ticket
             ));
         };
@@ -332,10 +349,15 @@ impl Handler {
             .wait(&mut attachment, Some(self.settings.pickup_wait), &context)
             .await
         {
-            Some(result) => finished(&result),
+            Some(outcome) => deliver(outcome),
             None => {
+                let pending = if attachment.is_redelivery() {
+                    format::pending_redelivery
+                } else {
+                    format::pending
+                };
                 let (text, output) =
-                    format::pending(&input.ticket, attachment.title(), attachment.questions());
+                    pending(&input.ticket, attachment.title(), attachment.questions());
                 success(text, output)
             }
         }
@@ -348,7 +370,7 @@ impl Handler {
         attachment: &mut Attachment,
         deadline: Option<Duration>,
         context: &RequestContext<RoleServer>,
-    ) -> Option<RoundResult> {
+    ) -> Option<Result<RoundResult, String>> {
         let deadline = async {
             match deadline {
                 Some(deadline) => tokio::time::sleep(deadline).await,

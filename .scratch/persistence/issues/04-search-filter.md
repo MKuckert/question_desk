@@ -16,3 +16,9 @@ Spec: `../spec.md` (story 12)
 - [ ] Read-model tests for each field and the multi-term AND.
 - [ ] Previews don't match.
 - [ ] Highlighting checked via `tools/screenshot.sh`.
+
+## Comments
+
+- Implemented on branch `persistence`: `src/search.rs` (terms, matching, highlight ranges), `Desk::set_filter` / `filter_terms`. ⌘F (Ctrl+F) focuses the field and Esc clears it. Hits are highlighted in question texts, Option labels and descriptions, and in the Answers and Notes on the Review and finished pages. Markdown bodies and the Note text field are matched but not highlighted.
+- Re-delivery banners are not filtered.
+- The highlight screenshot check could not run here: window capture is not permitted in this environment.

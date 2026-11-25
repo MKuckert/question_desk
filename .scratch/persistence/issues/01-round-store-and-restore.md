@@ -23,3 +23,8 @@ Persist every Question Round as `<data_dir>/rounds/<ticket>.json` and restore al
 - [ ] Corrupt and future-version files are skipped and left byte-identical.
 - [ ] Serialisation round-trip and v1 migration hook covered by unit tests.
 - [ ] Opened time visible in the header (check with `tools/screenshot.sh`).
+
+## Comments
+
+- Implemented on branch `persistence`: `src/store.rs` (format v1, migration hook, atomic owner-only writes), `Desk::with_store`, debounced draft writer, flush on quit. Quitting with a store keeps open rounds instead of cancelling them. Round ids are the Ticket, plus `@<n>` when a file or round already uses it.
+- The screenshot check could not run here: `screencapture` cannot capture the window from this agent's environment. `tools/screenshot.sh` now starts the app on temp config and data dirs (`-d` to choose one).
