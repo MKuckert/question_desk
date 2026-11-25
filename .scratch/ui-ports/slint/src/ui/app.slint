@@ -1,0 +1,1364 @@
+// The Question Desk window and its dialogs, built from Slint's std-widgets in the style chosen
+// at build time (`native` by default: Cupertino on macOS, Fluent on Windows, Qt or Fluent on
+// Linux). Colours come from `Palette`; only the warning and success hues are our own, because
+// `Palette` has no semantic colours.
+
+import {
+    AboutSlint, Button, CheckBox, LineEdit, ListView, Palette, RadioGroup, ScrollView,
+    StandardButton, TextEdit,
+} from "std-widgets.slint";
+
+// ---- Data the Rust side fills in ------------------------------------------------------------
+
+/// One row of the sidebar: an Agent Session header or one of its open rounds.
+export struct SidebarRow {
+    is-header: bool,
+    label: string,
+    ticket: string,
+    meta: string,
+    connected: bool,
+    new: bool,
+}
+
+/// One block of a Markdown `body`. `kind`: 0 paragraph or list (StyledText), 1 heading,
+/// 2 code block, 3 table row, 4 horizontal rule, 5 block quote.
+export struct MdBlock {
+    kind: int,
+    level: int,
+    text: styled-text,
+    code: string,
+    cells: [string],
+    header: bool,
+}
+
+export struct OptionEntry {
+    label: string,
+    description: string,
+    preview: string,
+    selected: bool,
+    recommended: bool,
+}
+
+/// `state`: 0 Unanswered, 1 Answered, 2 Current.
+export struct StepEntry {
+    state: int,
+    tip: string,
+}
+
+export struct ReviewEntry {
+    header: string,
+    question: string,
+    answer: string,
+    answered: bool,
+    note: string,
+}
+
+/// Colours `Palette` lacks: macOS systemOrange / systemGreen, light and dark.
+global Semantic {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    out property <color> warn: dark ? #ff9f0a : #c76a00;
+    out property <color> success: dark ? #30d158 : #248a3d;
+    out property <brush> muted: Palette.foreground.transparentize(0.45);
+    out property <brush> card: dark ? Palette.background.brighter(0.12) : Palette.background.brighter(0.5);
+    out property <brush> sunken: dark ? Palette.background.darker(0.25) : Palette.background.darker(0.04);
+}
+
+// ---- Small pieces ---------------------------------------------------------------------------
+
+component Icon inherits Image {
+    in property <brush> tint: Palette.foreground;
+    colorize: tint;
+    width: 16px;
+    height: 16px;
+    accessible-role: none;
+}
+
+/// A small rounded label: neutral, or filled with the accent colour.
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> accent;
+    border-radius: 4px;
+    background: accent ? Palette.accent-background : Palette.alternate-background;
+    border-width: accent ? 0 : 1px;
+    border-color: Palette.border;
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 1px;
+        padding-bottom: 1px;
+        Text {
+            text: root.text;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: accent ? Palette.accent-foreground : Palette.foreground;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// A key cap, e.g. the digit that selects an Option.
+component KeyCap inherits Rectangle {
+    in property <string> text;
+    border-radius: 4px;
+    background: Palette.alternate-background;
+    border-width: 1px;
+    border-color: Palette.border;
+    min-width: 18px;
+    HorizontalLayout {
+        padding-left: 5px;
+        padding-right: 5px;
+        Text {
+            text: root.text;
+            font-size: 0.8rem;
+            color: Semantic.muted;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component Hint inherits HorizontalLayout {
+    in property <string> key;
+    in property <string> label;
+    spacing: 4px;
+    KeyCap { text: root.key; }
+    Text {
+        text: root.label;
+        font-size: 0.85rem;
+        color: Semantic.muted;
+        vertical-alignment: center;
+    }
+}
+
+// ---- Markdown -------------------------------------------------------------------------------
+
+component MdBlockView inherits VerticalLayout {
+    in property <MdBlock> block;
+    in property <bool> first-row;
+
+    if block.kind == 0: StyledText {
+        text: block.text;
+        link-color: Palette.accent-background;
+        link-clicked(url) => { Bridge.open-url(url); }
+    }
+    if block.kind == 1: VerticalLayout {
+        padding-top: 4px;
+        StyledText {
+            text: block.text;
+            default-font-size: block.level <= 1 ? 1.45rem : block.level == 2 ? 1.25rem : 1.1rem;
+            link-color: Palette.accent-background;
+            link-clicked(url) => { Bridge.open-url(url); }
+        }
+    }
+    if block.kind == 2: Rectangle {
+        background: Semantic.sunken;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Palette.border;
+        VerticalLayout {
+            padding: 8px;
+            Text {
+                text: block.code;
+                font-family: "Menlo";
+                font-size: 0.92rem;
+                wrap: no-wrap;
+            }
+        }
+    }
+    if block.kind == 3: Rectangle {
+        background: block.header ? Semantic.sunken : transparent;
+        border-width: 1px;
+        border-color: Palette.border;
+        HorizontalLayout {
+            for cell in block.cells: Rectangle {
+                horizontal-stretch: 1;
+                preferred-width: 0;
+                min-width: 40px;
+                VerticalLayout {
+                    padding: 6px;
+                    Text {
+                        text: cell;
+                        wrap: word-wrap;
+                        font-weight: block.header ? 600 : 400;
+                    }
+                }
+            }
+        }
+    }
+    if block.kind == 4: Rectangle {
+        height: 1px;
+        background: Palette.border;
+    }
+    if block.kind == 5: HorizontalLayout {
+        spacing: 10px;
+        Rectangle {
+            width: 3px;
+            background: Palette.border;
+        }
+        StyledText {
+            text: block.text;
+            default-color: Semantic.muted;
+        }
+    }
+}
+
+component MarkdownView inherits VerticalLayout {
+    in property <[MdBlock]> blocks;
+    spacing: 8px;
+    for block[i] in blocks: MdBlockView {
+        block: block;
+        // Table rows sit flush against each other.
+        padding-top: block.kind == 3 && i > 0 && blocks[i - 1].kind == 3 ? -9px : 0;
+    }
+}
+
+// ---- Option cards ---------------------------------------------------------------------------
+
+component OptionCard inherits Rectangle {
+    in property <OptionEntry> option;
+    in property <int> index;
+    in property <bool> multi-select;
+    callback toggled();
+    out property <bool> hovered: touch.has-hover;
+
+    border-radius: 8px;
+    border-width: option.selected ? 2px : 1px;
+    border-color: option.selected ? Palette.accent-background : touch.has-hover ? Palette.foreground.transparentize(0.7) : Palette.border;
+    background: option.selected ? Palette.selection-background.transparentize(0.6) : touch.has-hover ? Palette.alternate-background : Semantic.card;
+
+    layout := HorizontalLayout {
+        padding: 10px;
+        padding-left: 12px;
+        spacing: 10px;
+        // The std-widget draws the mark; the card's TouchArea takes the clicks, so the widget's
+        // own state never diverges from the desk.
+        VerticalLayout {
+            alignment: start;
+            horizontal-stretch: 0;
+            if multi-select: CheckBox {
+                checked: option.selected;
+                text: "";
+            }
+            // RadioGroup cannot be cleared from outside, so it is recreated on every change.
+            if !multi-select && option.selected: RadioGroup {
+                RadioButton { text: ""; checked: true; }
+            }
+            if !multi-select && !option.selected: RadioGroup {
+                RadioButton { text: ""; }
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            alignment: center;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                if index < 9: KeyCap {
+                    text: index + 1;
+                    height: 18px;
+                    y: (parent.height - self.height) / 2;
+                }
+                Text {
+                    text: option.label;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+                if option.recommended: Chip {
+                    text: "Recommended";
+                    accent: true;
+                    height: 18px;
+                }
+            }
+            if option.description != "": Text {
+                text: option.description;
+                wrap: word-wrap;
+                color: Palette.foreground.transparentize(0.15);
+            }
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+    // The accessibility node of the card (the role must be a constant, hence two).
+    if multi-select: Rectangle {
+        accessible-role: checkbox;
+        accessible-label: option.label;
+        accessible-description: option.description;
+        accessible-checkable: true;
+        accessible-checked: option.selected;
+        accessible-action-default => { root.toggled(); }
+    }
+    if !multi-select: Rectangle {
+        accessible-role: radio-button;
+        accessible-label: option.label;
+        accessible-description: option.description;
+        accessible-checkable: true;
+        accessible-checked: option.selected;
+        accessible-action-default => { root.toggled(); }
+    }
+}
+
+component OptionList inherits VerticalLayout {
+    in property <[OptionEntry]> options;
+    in property <bool> multi-select;
+    in-out property <int> hovered: -1;
+    callback toggle(int);
+    spacing: 6px;
+    for option[i] in options: OptionCard {
+        option: option;
+        index: i;
+        multi-select: root.multi-select;
+        toggled => { root.toggle(i); }
+        changed hovered => {
+            if self.hovered {
+                root.hovered = i;
+            } else if root.hovered == i {
+                root.hovered = -1;
+            }
+        }
+    }
+}
+
+component PreviewPanel inherits Rectangle {
+    in property <string> preview;
+    background: Semantic.sunken;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Icon {
+                source: @image-url("../../assets/icons/eye.svg");
+                tint: Semantic.muted;
+                width: 14px;
+                height: 14px;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: "PREVIEW";
+                font-size: 0.8rem;
+                font-weight: 600;
+                color: Semantic.muted;
+            }
+        }
+        if preview != "": ScrollView {
+            min-height: min(inner.preferred-height, 420px);
+            inner := VerticalLayout {
+                Text {
+                    text: root.preview;
+                    font-family: "Menlo";
+                    font-size: 0.92rem;
+                    wrap: no-wrap;
+                }
+            }
+        }
+        if preview == "": Text {
+            text: "Hover an option to see its preview.";
+            color: Semantic.muted;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// ---- Bridge to Rust -------------------------------------------------------------------------
+
+export global Bridge {
+    callback open-url(string);
+}
+
+// ---- Main window ----------------------------------------------------------------------------
+
+export component AppWindow inherits Window {
+    title: "Question Desk";
+    preferred-width: 1100px;
+    preferred-height: 800px;
+    min-width: 520px;
+    min-height: 400px;
+    icon: @image-url("../../assets/icons/message-circle-question.svg");
+
+    // Sidebar
+    in property <[SidebarRow]> sidebar-rows;
+    in property <int> open-count;
+    in property <string> selected-ticket;
+    in-out property <bool> sidebar-visible: true;
+    in-out property <length> sidebar-width: 260px;
+
+    // Empty state
+    in property <string> status;
+
+    // The selected round
+    in property <bool> has-round;
+    in property <string> session;
+    in property <string> round-title;
+    in property <bool> connected: true;
+    /// Index of the current Question, or -1 on the Review Page.
+    in property <int> step-index;
+    in property <[StepEntry]> steps;
+    in property <string> header;
+    in property <string> question;
+    in property <[MdBlock]> body;
+    in property <string> recommendation-text;
+    in property <[OptionEntry]> options;
+    in property <bool> multi-select;
+    in property <string> selected-preview;
+    in property <string> note-text;
+    in property <bool> accepts-recommendation;
+    in property <[ReviewEntry]> review;
+    in property <int> unanswered-count;
+    /// Changes whenever another Question is shown, so the page scrolls back to the top.
+    in property <string> page-key;
+
+    /// A dialog is open; the window ignores input until it closes.
+    in property <bool> modal-open;
+    /// 0 system, 1 light, 2 dark.
+    in-out property <int> appearance;
+    /// The OS colour scheme, for going back to "System" after an explicit choice.
+    in property <ColorScheme> system-scheme;
+    in property <string> cmd: "⌘";
+
+    callback select-round(string);
+    callback toggle-option(int);
+    callback note-edited(string);
+    callback next();
+    callback back();
+    callback go-to(int);
+    callback review-requested();
+    callback submit-requested();
+    callback cancel-requested();
+    callback accept-recommendation();
+    callback settings-requested();
+    callback close-requested();
+    callback zoom(int);
+    callback emoji-picker();
+    callback appearance-changed(int);
+    /// The desk changed on the Agent side; `true` when a new round arrived.
+    callback desk-changed(bool);
+    callback about-requested();
+
+    property <int> hovered-option: -1;
+    property <string> preview: hovered-option >= 0 && hovered-option < options.length && options[hovered-option].preview != "" ? options[hovered-option].preview : selected-preview;
+    property <bool> has-previews: selected-preview != "" || options-have-previews;
+    in property <bool> options-have-previews;
+
+    changed note-text => {
+        if note.text != note-text {
+            note.text = note-text;
+        }
+    }
+    changed page-key => {
+        hovered-option = -1;
+        page.content-y = 0;
+        review-page.content-y = 0;
+    }
+    changed appearance => {
+        Palette.color-scheme = appearance == 1 ? ColorScheme.light : appearance == 2 ? ColorScheme.dark : root.system-scheme;
+    }
+
+    /// Puts the cursor back after the Rust side repaired the Note (grapheme-aware backspace).
+    public function set-note(text: string, cursor: int) {
+        note.text = text;
+        note.set-selection-offsets(cursor, cursor);
+    }
+
+    public function focus-keys() {
+        keys.focus();
+    }
+
+    function edit(action: int) {
+        if note.has-focus {
+            if action == 0 { note.cut(); }
+            if action == 1 { note.copy(); }
+            if action == 2 { note.paste(); }
+            if action == 3 { note.select-all(); }
+        }
+    }
+
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Settings…";
+                shortcut: @keys(Control + ",");
+                enabled: !root.modal-open;
+                activated => { root.settings-requested(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Close Window";
+                shortcut: @keys(Control + W);
+                activated => { root.close-requested(); }
+            }
+        }
+        Menu {
+            title: "Edit";
+            MenuItem {
+                title: "Cut";
+                shortcut: @keys(Control + X);
+                activated => { root.edit(0); }
+            }
+            MenuItem {
+                title: "Copy";
+                shortcut: @keys(Control + C);
+                activated => { root.edit(1); }
+            }
+            MenuItem {
+                title: "Paste";
+                shortcut: @keys(Control + V);
+                activated => { root.edit(2); }
+            }
+            MenuItem {
+                title: "Select All";
+                shortcut: @keys(Control + A);
+                activated => { root.edit(3); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Emoji & Symbols";
+                shortcut: @keys(Control + Meta + Space);
+                activated => { root.emoji-picker(); }
+            }
+        }
+        Menu {
+            title: "View";
+            MenuItem {
+                title: root.sidebar-visible ? "Hide Open Rounds" : "Show Open Rounds";
+                shortcut: @keys(Control + Meta + S);
+                activated => { root.sidebar-visible = !root.sidebar-visible; }
+            }
+            MenuSeparator { }
+            Menu {
+                title: "Appearance";
+                MenuItem {
+                    title: "System";
+                    checkable: true;
+                    checked: root.appearance == 0;
+                    activated => { root.appearance-changed(0); }
+                }
+                MenuItem {
+                    title: "Light";
+                    checkable: true;
+                    checked: root.appearance == 1;
+                    activated => { root.appearance-changed(1); }
+                }
+                MenuItem {
+                    title: "Dark";
+                    checkable: true;
+                    checked: root.appearance == 2;
+                    activated => { root.appearance-changed(2); }
+                }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Actual Size";
+                shortcut: @keys(Control + "0");
+                activated => { root.zoom(0); }
+            }
+            MenuItem {
+                title: "Zoom In";
+                shortcut: @keys(Control + Shift? + "+");
+                activated => { root.zoom(1); }
+            }
+            MenuItem {
+                title: "Zoom Out";
+                shortcut: @keys(Control + "-");
+                activated => { root.zoom(-1); }
+            }
+        }
+        Menu {
+            title: "Round";
+            MenuItem {
+                title: root.step-index < 0 ? "Submit" : "Next Question";
+                shortcut: @keys(Control + Return);
+                enabled: root.has-round && !root.modal-open;
+                activated => {
+                    if root.step-index < 0 {
+                        root.submit-requested();
+                    } else {
+                        root.next();
+                    }
+                }
+            }
+            MenuItem {
+                title: "Previous Question";
+                shortcut: @keys(Control + Shift + Return);
+                enabled: root.has-round && !root.modal-open && root.step-index != 0;
+                activated => { root.back(); }
+            }
+            MenuItem {
+                title: "Review";
+                enabled: root.has-round && !root.modal-open;
+                activated => { root.review-requested(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Cancel Round…";
+                enabled: root.has-round && !root.modal-open;
+                activated => { root.cancel-requested(); }
+            }
+        }
+        Menu {
+            title: "Help";
+            MenuItem {
+                title: "About Question Desk";
+                activated => { root.about-requested(); }
+            }
+        }
+    }
+
+    keys := FocusScope {
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if root.modal-open || !root.has-round {
+                return reject;
+            }
+            if event.modifiers.control || event.modifiers.meta || event.modifiers.alt {
+                return reject;
+            }
+            if event.text == Key.Escape {
+                root.cancel-requested();
+                return accept;
+            }
+            if root.step-index < 0 {
+                return reject;
+            }
+            if event.text == Key.Tab {
+                note.focus();
+                return accept;
+            }
+            if event.text == Key.Return && root.accepts-recommendation {
+                root.accept-recommendation();
+                return accept;
+            }
+            if event.text.is-float() {
+                let n = event.text.to-float();
+                if n >= 1 && n <= 9 && n == floor(n) {
+                    root.toggle-option(n - 1);
+                    return accept;
+                }
+            }
+            reject
+        }
+
+        HorizontalLayout {
+            // ---- Sidebar ----
+            if root.sidebar-visible: Rectangle {
+                width: root.sidebar-width;
+                background: Palette.alternate-background;
+                VerticalLayout {
+                    padding: 10px;
+                    padding-top: 12px;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        alignment: start;
+                        padding-left: 4px;
+                        Text {
+                            text: "OPEN ROUNDS";
+                            font-size: 0.8rem;
+                            font-weight: 600;
+                            color: Semantic.muted;
+                            vertical-alignment: center;
+                        }
+                        if root.open-count > 0: Chip { text: root.open-count; }
+                    }
+                    if root.sidebar-rows.length == 0: Text {
+                        text: "Nothing waiting";
+                        color: Semantic.muted;
+                        x: 4px;
+                    }
+                    ListView {
+                        vertical-stretch: 1;
+                        for row in root.sidebar-rows: Rectangle {
+                            height: layout.preferred-height;
+                            property <bool> selected: !row.is-header && row.ticket == root.selected-ticket;
+                            border-radius: 6px;
+                            background: selected ? Palette.selection-background : row-touch.has-hover && !row.is-header ? Palette.foreground.transparentize(0.93) : transparent;
+                            accessible-role: list-item;
+                            accessible-label: row.label;
+                            accessible-item-selected: selected;
+                            accessible-action-default => { if !row.is-header { root.select-round(row.ticket); } }
+                            layout := HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                padding-top: row.is-header ? 10px : 5px;
+                                padding-bottom: row.is-header ? 2px : 5px;
+                                spacing: 6px;
+                                VerticalLayout {
+                                    spacing: 1px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: row.label;
+                                        font-size: row.is-header ? 0.85rem : 1rem;
+                                        font-weight: row.is-header ? 400 : 600;
+                                        color: row.is-header ? Semantic.muted : selected ? Palette.selection-foreground : Palette.foreground;
+                                        overflow: elide;
+                                    }
+                                    if !row.is-header: Text {
+                                        text: row.meta;
+                                        font-size: 0.85rem;
+                                        color: row.connected ? Semantic.muted : Semantic.warn;
+                                        overflow: elide;
+                                    }
+                                }
+                                if row.new: VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 0;
+                                    Chip { text: "New"; accent: true; }
+                                }
+                            }
+                            row-touch := TouchArea {
+                                enabled: !row.is-header;
+                                clicked => { root.select-round(row.ticket); }
+                            }
+                        }
+                    }
+                }
+            }
+            if root.sidebar-visible: Rectangle {
+                width: 1px;
+                background: Palette.border;
+                // Drag to resize the sidebar.
+                TouchArea {
+                    width: 7px;
+                    x: -3px;
+                    mouse-cursor: col-resize;
+                    moved => {
+                        root.sidebar-width = max(200px, min(480px, root.sidebar-width + self.mouse-x - self.pressed-x));
+                    }
+                }
+            }
+
+            // ---- Main column ----
+            VerticalLayout {
+                // Top bar
+                Rectangle {
+                    background: Palette.alternate-background;
+                    VerticalLayout {
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 8px;
+                            Button {
+                                icon: root.sidebar-visible ? @image-url("../../assets/icons/panel-left-close.svg") : @image-url("../../assets/icons/panel-left-open.svg");
+                                colorize-icon: true;
+                                accessible-label: root.sidebar-visible ? "Hide open rounds" : "Show open rounds";
+                                clicked => { root.sidebar-visible = !root.sidebar-visible; }
+                                Tooltip { text: root.sidebar-visible ? @markdown("Hide open rounds") : @markdown("Show open rounds"); }
+                            }
+                            Icon {
+                                source: @image-url("../../assets/icons/message-circle-question.svg");
+                                tint: Palette.accent-background;
+                                width: 20px;
+                                height: 20px;
+                                y: (parent.height - self.height) / 2;
+                            }
+                            Text {
+                                text: "Question Desk";
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            if root.has-round: Text {
+                                text: "/";
+                                color: Semantic.muted;
+                                vertical-alignment: center;
+                            }
+                            if root.has-round: Text {
+                                text: root.session;
+                                color: Semantic.muted;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 0;
+                            }
+                            if root.has-round && root.round-title != "": Text {
+                                text: root.round-title;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if root.has-round && !root.connected: HorizontalLayout {
+                                spacing: 4px;
+                                Icon {
+                                    source: @image-url("../../assets/icons/triangle-alert.svg");
+                                    tint: Semantic.warn;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                                Text {
+                                    text: "Agent disconnected";
+                                    color: Semantic.warn;
+                                    vertical-alignment: center;
+                                    Tooltip { text: @markdown("No Agent call is waiting for this round. Your answers are kept; the Agent can pick them up with its ticket."); }
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            if root.has-round && root.step-index >= 0: Text {
+                                text: (root.step-index + 1) + " / " + root.steps.length;
+                                font-weight: 600;
+                                color: Semantic.muted;
+                                vertical-alignment: center;
+                            }
+                            if root.has-round: VerticalLayout {
+                                alignment: center;
+                                Chip { text: root.step-index >= 0 ? root.header : "Review"; }
+                            }
+                            Button {
+                                icon: @image-url("../../assets/icons/settings.svg");
+                                colorize-icon: true;
+                                accessible-label: "Settings";
+                                clicked => { root.settings-requested(); }
+                                Tooltip { text: @markdown("Settings (\{root.cmd},)"); }
+                            }
+                        }
+                        Rectangle { height: 1px; background: Palette.border; }
+                    }
+                }
+
+                // Page
+                Rectangle {
+                vertical-stretch: 1;
+                Rectangle {
+                visible: !root.has-round;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 10px;
+                    padding: 24px;
+                    vertical-stretch: 1;
+                    HorizontalLayout {
+                        alignment: center;
+                        Icon {
+                            source: @image-url("../../assets/icons/inbox.svg");
+                            tint: Semantic.muted;
+                            width: 40px;
+                            height: 40px;
+                        }
+                    }
+                    Text {
+                        text: "No open questions";
+                        font-size: 1.5rem;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: root.status;
+                        color: Semantic.muted;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+                }
+
+                Rectangle {
+                visible: root.has-round;
+                VerticalLayout {
+                    vertical-stretch: 1;
+                    // Step bar
+                    HorizontalLayout {
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        padding-top: 14px;
+                        padding-bottom: 6px;
+                        alignment: start;
+                        spacing: 6px;
+                        for step[i] in root.steps: Button {
+                            text: step.state == 1 ? (i + 1) + " ✓" : i + 1;
+                            primary: step.state == 2;
+                            accessible-label: "Question " + (i + 1) + ": " + step.tip;
+                            clicked => { root.go-to(i); }
+                            Tooltip { text: @markdown("\{step.tip}"); }
+                        }
+                        Button {
+                            text: "Review";
+                            primary: root.step-index < 0;
+                            clicked => { root.review-requested(); }
+                        }
+                    }
+
+                    Rectangle {
+                    vertical-stretch: 1;
+                    page := ScrollView {
+                        visible: root.step-index >= 0;
+                        HorizontalLayout {
+                            alignment: center;
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            padding-top: 10px;
+                            padding-bottom: 24px;
+                            content := VerticalLayout {
+                                width: min(960px, page.visible-width - 48px);
+                                alignment: start;
+                                spacing: 12px;
+
+                                // Question page
+                                VerticalLayout {
+                                    alignment: start;
+                                    spacing: 12px;
+                                    Text {
+                                        text: root.question;
+                                        font-size: 1.45rem;
+                                        font-weight: 600;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.body.length > 0: Rectangle {
+                                        background: Semantic.card;
+                                        border-radius: 8px;
+                                        border-width: 1px;
+                                        border-color: Palette.border;
+                                        VerticalLayout {
+                                            padding: 12px;
+                                            MarkdownView { blocks: root.body; }
+                                        }
+                                    }
+                                    if root.recommendation-text != "": HorizontalLayout {
+                                        spacing: 8px;
+                                        Icon {
+                                            source: @image-url("../../assets/icons/sparkles.svg");
+                                            tint: Palette.accent-background;
+                                            y: 2px;
+                                        }
+                                        VerticalLayout {
+                                            alignment: start;
+                                            Chip { text: "Recommended"; accent: true; }
+                                        }
+                                        Text {
+                                            text: root.recommendation-text;
+                                            wrap: word-wrap;
+                                            horizontal-stretch: 1;
+                                        }
+                                    }
+                                    if root.options.length == 0: Text {
+                                        text: "Open question: answer in the note below.";
+                                        color: Semantic.muted;
+                                    }
+                                    if root.options.length > 0 && root.has-previews && content.width >= 720px: HorizontalLayout {
+                                        spacing: 12px;
+                                        alignment: stretch;
+                                        OptionList {
+                                            options: root.options;
+                                            multi-select: root.multi-select;
+                                            hovered <=> root.hovered-option;
+                                            toggle(i) => { root.toggle-option(i); }
+                                            width: (parent.width - 12px) / 2;
+                                        }
+                                        VerticalLayout {
+                                            alignment: start;
+                                            PreviewPanel { preview: root.preview; }
+                                        }
+                                    }
+                                    if root.options.length > 0 && !(root.has-previews && content.width >= 720px): VerticalLayout {
+                                        spacing: 8px;
+                                        OptionList {
+                                            options: root.options;
+                                            multi-select: root.multi-select;
+                                            hovered <=> root.hovered-option;
+                                            toggle(i) => { root.toggle-option(i); }
+                                        }
+                                        if root.preview != "": PreviewPanel { preview: root.preview; }
+                                    }
+                                    VerticalLayout {
+                                        spacing: 6px;
+                                        padding-top: 6px;
+                                        Text {
+                                            text: "Note";
+                                            font-weight: 600;
+                                        }
+                                        note := TextEdit {
+                                            height: 96px;
+                                            wrap: word-wrap;
+                                            placeholder-text: root.options.length == 0 ? "Your answer" : root.options-selected ? "Note (optional): caveats, reasons, “yes, but …”" : "Note: without a selected option, this text is your answer";
+                                            edited(text) => { root.note-edited(text); }
+                                            key-pressed(event) => {
+                                                if event.text == Key.Escape {
+                                                    keys.focus();
+                                                    return accept;
+                                                }
+                                                reject
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Review page
+                    review-page := ScrollView {
+                        visible: root.step-index < 0;
+                        HorizontalLayout {
+                            alignment: center;
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            padding-top: 10px;
+                            padding-bottom: 24px;
+                            VerticalLayout {
+                                width: min(960px, review-page.visible-width - 48px);
+                                alignment: start;
+                                VerticalLayout {
+                                    alignment: start;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "Review your answers";
+                                        font-size: 1.45rem;
+                                        font-weight: 600;
+                                    }
+                                    if root.unanswered-count > 0: HorizontalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+                                        Icon {
+                                            source: @image-url("../../assets/icons/triangle-alert.svg");
+                                            tint: Semantic.warn;
+                                            y: (parent.height - self.height) / 2;
+                                        }
+                                        Text {
+                                            text: root.unanswered-count + " question(s) unanswered";
+                                            color: Semantic.warn;
+                                        }
+                                    }
+                                    for item[i] in root.review: Rectangle {
+                                        border-radius: 8px;
+                                        border-width: 1px;
+                                        border-color: !item.answered ? Semantic.warn : review-touch.has-hover ? Palette.foreground.transparentize(0.7) : Palette.border;
+                                        background: review-touch.has-hover ? Palette.alternate-background : Semantic.card;
+                                        accessible-role: button;
+                                        accessible-label: "Edit answer to question " + (i + 1);
+                                        accessible-action-default => { root.go-to(i); }
+                                        VerticalLayout {
+                                            padding: 12px;
+                                            spacing: 4px;
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Icon {
+                                                    source: item.answered ? @image-url("../../assets/icons/circle-check-big.svg") : @image-url("../../assets/icons/triangle-alert.svg");
+                                                    tint: item.answered ? Semantic.success : Semantic.warn;
+                                                    y: 2px;
+                                                }
+                                                Text {
+                                                    text: (i + 1) + ".";
+                                                    color: Semantic.muted;
+                                                }
+                                                VerticalLayout {
+                                                    alignment: start;
+                                                    Chip { text: item.header; }
+                                                }
+                                                Text {
+                                                    text: item.question;
+                                                    font-weight: 600;
+                                                    wrap: word-wrap;
+                                                    horizontal-stretch: 1;
+                                                }
+                                            }
+                                            Text {
+                                                text: item.answered ? item.answer : "Unanswered";
+                                                font-italic: !item.answered;
+                                                color: item.answered ? Palette.foreground : Semantic.warn;
+                                                wrap: word-wrap;
+                                            }
+                                            if item.note != "": Text {
+                                                text: "Note: " + item.note;
+                                                color: Semantic.muted;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                        review-touch := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.go-to(i); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    }
+
+                    // Footer
+                    Rectangle { height: 1px; background: Palette.border; }
+                    Rectangle {
+                        background: Palette.alternate-background;
+                        VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel round";
+                                    icon: @image-url("../../assets/icons/x.svg");
+                                    colorize-icon: true;
+                                    clicked => { root.cancel-requested(); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "Back";
+                                    icon: @image-url("../../assets/icons/chevron-left.svg");
+                                    colorize-icon: true;
+                                    enabled: root.step-index != 0;
+                                    clicked => { root.back(); }
+                                }
+                                Button {
+                                    text: root.step-index < 0 ? "Submit" : "Next";
+                                    icon: root.step-index < 0 ? @image-url("../../assets/icons/send.svg") : @image-url("../../assets/icons/chevron-right.svg");
+                                    colorize-icon: true;
+                                    primary: true;
+                                    min-width: 112px;
+                                    clicked => {
+                                        if root.step-index < 0 {
+                                            root.submit-requested();
+                                        } else {
+                                            root.next();
+                                        }
+                                    }
+                                }
+                            }
+                            if root.step-index >= 0: HorizontalLayout {
+                                spacing: 14px;
+                                alignment: start;
+                                Hint { key: "1–9"; label: "select"; }
+                                Hint { key: "Tab"; label: "note"; }
+                                Hint { key: "⏎"; label: "accept recommendation"; }
+                                Hint { key: root.cmd + "⏎"; label: "next"; }
+                                Hint { key: root.cmd + "⇧⏎"; label: "back"; }
+                                Hint { key: "Esc"; label: "leave note / cancel"; }
+                            }
+                            if root.step-index < 0: HorizontalLayout {
+                                spacing: 14px;
+                                alignment: start;
+                                Hint { key: root.cmd + "⏎"; label: "submit"; }
+                                Hint { key: root.cmd + "⇧⏎"; label: "back"; }
+                                Hint { key: "Esc"; label: "cancel"; }
+                            }
+                        }
+                    }
+                }
+                }
+                }
+            }
+        }
+    }
+    in property <bool> options-selected;
+
+    // While a dialog window is open, swallow clicks on this one.
+    if root.modal-open: TouchArea {
+        width: 100%;
+        height: 100%;
+        Rectangle { background: Palette.background.transparentize(0.6); }
+    }
+}
+
+// ---- Dialogs (separate windows) -------------------------------------------------------------
+
+/// Cancel round / Submit with Unanswered / Close the Question Desk.
+export component ConfirmDialog inherits Dialog {
+    in property <string> heading;
+    in property <string> message;
+    in property <string> confirm-label;
+    in property <bool> destructive;
+    /// Only the harmless dialog confirms on Enter; cancelling needs a click.
+    in property <bool> enter-confirms;
+    callback confirmed();
+    callback dismissed();
+    /// The main window's explicit appearance; `unknown` follows the system.
+    in property <ColorScheme> scheme;
+    changed scheme => {
+        if scheme != ColorScheme.unknown {
+            Palette.color-scheme = scheme;
+        }
+    }
+    title: "";
+
+    FocusScope {
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.dismissed();
+                return accept;
+            }
+            if event.text == Key.Return && root.enter-confirms {
+                root.confirmed();
+                return accept;
+            }
+            reject
+        }
+        VerticalLayout {
+            padding: 20px;
+            spacing: 8px;
+            max-width: 460px;
+            Text {
+                text: root.heading;
+                font-size: 1.15rem;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+            Text {
+                text: root.message;
+                wrap: word-wrap;
+                color: Semantic.muted;
+            }
+        }
+    }
+    Button {
+        text: root.confirm-label;
+        dialog-button-role: accept;
+        primary: !root.destructive;
+        clicked => { root.confirmed(); }
+    }
+    Button {
+        text: "Keep answering";
+        dialog-button-role: reject;
+        clicked => { root.dismissed(); }
+    }
+}
+
+export component SettingsDialog inherits Dialog {
+    in-out property <string> host;
+    in-out property <string> port;
+    in-out property <string> token;
+    in property <string> default-host;
+    in property <string> default-port;
+    in property <[string]> warnings;
+    in property <string> saved-in;
+    callback edited();
+    callback save();
+    callback cancel();
+    in property <ColorScheme> scheme;
+    changed scheme => {
+        if scheme != ColorScheme.unknown {
+            Palette.color-scheme = scheme;
+        }
+    }
+    title: "Settings";
+
+    FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.cancel();
+                return accept;
+            }
+            reject
+        }
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+            width: 480px;
+            Text {
+                text: "Where Agents reach the MCP server. Saving restarts the server; Agents already waiting for answers stay connected.";
+                wrap: word-wrap;
+                color: Semantic.muted;
+            }
+            GridLayout {
+                spacing: 8px;
+                Row {
+                    Text { text: "Host"; vertical-alignment: center; horizontal-alignment: right; }
+                    host-edit := LineEdit {
+                        text <=> root.host;
+                        placeholder-text: root.default-host;
+                        edited => { root.edited(); }
+                        accepted => { root.save(); }
+                        init => { self.focus(); }
+                    }
+                }
+                Row {
+                    Text { text: "Port"; vertical-alignment: center; horizontal-alignment: right; }
+                    HorizontalLayout {
+                        LineEdit {
+                            text <=> root.port;
+                            width: 96px;
+                            placeholder-text: root.default-port;
+                            input-type: number;
+                            edited => { root.edited(); }
+                            accepted => { root.save(); }
+                        }
+                        Rectangle { }
+                    }
+                }
+                Row {
+                    Text { text: "Access token"; vertical-alignment: center; horizontal-alignment: right; }
+                    LineEdit {
+                        text <=> root.token;
+                        // The style's password field has its own show/hide button.
+                        input-type: password;
+                        placeholder-text: "None: every local client may connect";
+                        edited => { root.edited(); }
+                        accepted => { root.save(); }
+                    }
+                }
+            }
+            for warning in root.warnings: HorizontalLayout {
+                spacing: 6px;
+                Icon {
+                    source: @image-url("../../assets/icons/triangle-alert.svg");
+                    tint: Semantic.warn;
+                    y: 2px;
+                }
+                Text {
+                    text: warning;
+                    color: Semantic.warn;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+            if root.saved-in != "": Text {
+                text: "Saved in " + root.saved-in;
+                font-size: 0.85rem;
+                overflow: elide;
+                color: Semantic.muted;
+            }
+        }
+    }
+    Button {
+        text: "Save";
+        dialog-button-role: accept;
+        primary: true;
+        clicked => { root.save(); }
+    }
+    Button {
+        text: "Cancel";
+        dialog-button-role: reject;
+        clicked => { root.cancel(); }
+    }
+}
+
+/// Help → About. Showing `AboutSlint` from a top-level menu is the attribution the Slint
+/// Royalty-free License 2.0 asks for.
+export component AboutDialog inherits Dialog {
+    in property <ColorScheme> scheme;
+    callback dismissed();
+    changed scheme => {
+        if scheme != ColorScheme.unknown {
+            Palette.color-scheme = scheme;
+        }
+    }
+    title: "About Question Desk";
+    VerticalLayout {
+        padding: 20px;
+        spacing: 12px;
+        width: 360px;
+        Text {
+            text: "Question Desk";
+            font-size: 1.3rem;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Answer your Agents' questions in one window.";
+            color: Semantic.muted;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+        AboutSlint { }
+    }
+    StandardButton {
+        kind: StandardButtonKind.close;
+        clicked => { root.dismissed(); }
+    }
+}

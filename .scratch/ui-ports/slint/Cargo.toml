@@ -1,0 +1,41 @@
+[package]
+name = "question-desk"
+version = "0.1.0"
+edition = "2024"
+default-run = "question-desk"
+
+[dependencies]
+axum = "0.8"
+directories = "6.0.0"
+env_logger = "0.11.11"
+futures-util = "0.3.34"
+log = "0.4.35"
+png = "0.18"
+pulldown-cmark = "0.13.6"
+pulldown-cmark-to-cmark = "23.0.1"
+rmcp = { version = "3.9", features = ["server", "client", "transport-streamable-http-server", "transport-streamable-http-client-reqwest", "schemars"] }
+schemars = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "accessibility", "backend-winit", "renderer-skia-opengl", "unstable-winit-030"] }
+serde_path_to_error = "0.1.20"
+tokio = { version = "1", features = ["full"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+unicode-segmentation = "1.13.3"
+
+[build-dependencies]
+slint-build = "=1.18.1"
+
+[dev-dependencies]
+insta = "1.49.0"
+reqwest = "0.13.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAttributedString", "NSRange", "NSString"] }
+
+[features]
+# Qt backend (QStyle-drawn widgets, `qt` style). Needs Qt 6 (`qmake6` on PATH) at build time.
+qt = ["slint/backend-qt"]

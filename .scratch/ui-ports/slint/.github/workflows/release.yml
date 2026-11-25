@@ -1,0 +1,116 @@
+name: Release
+
+# Push a tag like `v0.1.0` to build the app for every target and attach the
+# archives to a GitHub Release. The release version comes from the tag; the
+# `version` in Cargo.toml does not need to match.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # The tag is the source of truth for the release version: stamp it into
+      # Cargo.toml and Cargo.lock (so `--locked` still passes) before building.
+      - name: Set version from tag
+        shell: bash
+        run: |
+          version="${TAG#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $TAG is not a semver version like v1.2.3"
+            exit 1
+          fi
+          export VERSION="$version"
+          perl -0pi -e 's/(\[package\]\nname = "question-desk"\nversion = )"[^"]*"/$1"$ENV{VERSION}"/' Cargo.toml
+          perl -0pi -e 's/(\[\[package\]\]\nname = "question-desk"\nversion = )"[^"]*"/$1"$ENV{VERSION}"/' Cargo.lock
+          grep -q "^version = \"$version\"" Cargo.toml || { echo "::error::Failed to set version in Cargo.toml"; exit 1; }
+          grep -A1 '^name = "question-desk"$' Cargo.lock | grep -q "^version = \"$version\"" || { echo "::error::Failed to set version in Cargo.lock"; exit 1; }
+          echo "Building version $version"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin question-desk --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="question-desk-$TAG-${{ matrix.target }}"
+          mkdir "$name"
+          cp README.md "$name/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/question-desk.exe" "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            cp "target/${{ matrix.target }}/release/question-desk" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+          fi
