@@ -1,0 +1,16 @@
+node_modules
+.DS_Store
+
+~$*
+
+.env
+.env.*
+
+
+target/
+
+.cargo-home/
+*.pending-snap
+
+# Tauri: generated capability schemas
+gen/

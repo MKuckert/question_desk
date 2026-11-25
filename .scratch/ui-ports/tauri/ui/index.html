@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Question Desk</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <nav id="sidebar" aria-label="Open rounds"></nav>
+      <div id="resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar"></div>
+      <div id="main">
+        <header id="toolbar" data-tauri-drag-region></header>
+        <div id="steps"></div>
+        <main id="page" tabindex="-1"></main>
+        <footer id="footer"></footer>
+      </div>
+    </div>
+
+    <dialog id="settings" aria-labelledby="settings-title">
+      <form id="settings-form" novalidate>
+        <h2 id="settings-title">Settings</h2>
+        <p class="secondary">
+          Where Agents reach the MCP server. Saving restarts the server; Agents already waiting
+          for answers stay connected.
+        </p>
+        <div class="form-grid">
+          <label for="s-host">Host</label>
+          <input id="s-host" name="host" type="text" autocomplete="off" spellcheck="false" />
+          <label for="s-port">Port</label>
+          <input id="s-port" name="port" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" class="narrow" />
+          <label for="s-token">Access token</label>
+          <input id="s-token" name="token" type="password" autocomplete="off" spellcheck="false"
+                 placeholder="None: every local client may connect" />
+          <span></span>
+          <label class="check"><input id="s-show" type="checkbox" /> Show token</label>
+        </div>
+        <div id="s-warnings" role="status"></div>
+        <p id="s-path" class="secondary small"></p>
+        <div class="buttons">
+          <button type="button" id="s-cancel">Cancel</button>
+          <button type="submit" class="default">Save</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

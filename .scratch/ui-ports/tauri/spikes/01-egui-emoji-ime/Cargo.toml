@@ -1,0 +1,22 @@
+[package]
+name = "spike-egui-emoji-ime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Throwaway spike for ADR 0005; not part of the Question Desk crate.
+[workspace]
+
+[dependencies]
+eframe = "0.37"
+egui_commonmark = "0.26"
+egui_system_font_provider = "0.37"
+env_logger = "0.11"
+log = "0.4"
+png = "0.18"
+unicode-segmentation = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAttributedString", "NSRange", "NSString"] }

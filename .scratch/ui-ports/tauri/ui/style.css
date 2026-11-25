@@ -1,0 +1,871 @@
+/* Question Desk: system font, system colours, native controls. No colour literals except the
+   fallbacks for webviews without the macOS `-apple-system-*` colours. */
+
+:root {
+  color-scheme: light dark;
+  --accent: Highlight;
+  --on-accent: HighlightText;
+  --label: CanvasText;
+  --secondary: color-mix(in srgb, CanvasText 58%, transparent);
+  --tertiary: color-mix(in srgb, CanvasText 32%, transparent);
+  --separator: color-mix(in srgb, CanvasText 13%, transparent);
+  --fill: color-mix(in srgb, CanvasText 4%, transparent);
+  --fill-strong: color-mix(in srgb, CanvasText 9%, transparent);
+  --content: Canvas;
+  --warn: #b25000;
+  --success: #248a3d;
+  --sidebar-bg: color-mix(in srgb, Canvas 94%, CanvasText);
+  --sidebar-w: 260px;
+  --toolbar-h: 52px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --warn: #ff9f0a;
+    --success: #30d158;
+  }
+}
+@supports (color: AccentColor) {
+  :root {
+    --accent: AccentColor;
+    --on-accent: AccentColorText;
+  }
+}
+/* WebKit on macOS: the real system palette, following the user's accent and appearance. */
+@supports (color: -apple-system-control-accent) {
+  :root {
+    --accent: -apple-system-control-accent;
+    --on-accent: -apple-system-alternate-selected-text;
+    --label: -apple-system-label;
+    --secondary: -apple-system-secondary-label;
+    --tertiary: -apple-system-tertiary-label;
+    --separator: -apple-system-separator;
+    --content: -apple-system-text-background;
+    --warn: -apple-system-orange;
+    --success: -apple-system-green;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  /* No rubber band on the window itself; the scrolling panes keep theirs. */
+  overscroll-behavior: none;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI", Cantarell, "Noto Sans",
+    Ubuntu, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--label);
+  background: var(--content);
+  /* Chrome is not selectable text; content opts back in with `.selectable`. */
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+  -webkit-font-smoothing: auto;
+}
+@supports (font: -apple-system-body) {
+  body {
+    font: -apple-system-body;
+    line-height: 1.4;
+  }
+}
+
+/* Windows with a material behind the page: the page is transparent, the content opaque. */
+[data-platform="macos"] body,
+[data-platform="windows"] body {
+  background: transparent;
+}
+
+.selectable,
+.selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* The platform's own focus ring, but only where the keyboard put focus. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+#page:focus,
+#main:focus {
+  outline: none;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+svg.icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: -3px;
+}
+
+/* ---- Layout -------------------------------------------------------------------------- */
+
+#app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 0 minmax(0, 1fr);
+  height: 100vh;
+}
+#app.sidebar-hidden {
+  grid-template-columns: 0 0 minmax(0, 1fr);
+}
+#app.sidebar-hidden #sidebar,
+#app.sidebar-hidden #resizer {
+  display: none;
+}
+
+#main {
+  display: grid;
+  grid-template-rows: var(--toolbar-h) auto minmax(0, 1fr) auto;
+  min-width: 0;
+  background: var(--content);
+  border-left: 1px solid var(--separator);
+}
+#app.sidebar-hidden #main {
+  border-left: none;
+}
+
+#resizer {
+  position: relative;
+  z-index: 2;
+  width: 0;
+}
+#resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 -4px;
+  cursor: col-resize;
+}
+
+/* ---- Sidebar ------------------------------------------------------------------------- */
+
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--sidebar-bg);
+  overflow: hidden;
+}
+[data-platform="macos"] #sidebar {
+  background: transparent;
+}
+[data-platform="windows"] #sidebar {
+  background: color-mix(in srgb, Canvas 45%, transparent);
+}
+
+.sidebar-top {
+  flex: none;
+  height: var(--toolbar-h);
+}
+html:not([data-platform="macos"]) .sidebar-top {
+  height: 12px;
+}
+
+.sidebar-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 10px 12px;
+}
+
+.section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 4px 8px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--tertiary);
+}
+
+.session-label {
+  margin: 10px 8px 2px;
+  font-size: 11px;
+  color: var(--secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nothing {
+  padding: 6px 8px;
+  color: var(--secondary);
+}
+
+.round-row {
+  display: block;
+  width: 100%;
+  margin: 1px 0;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.round-row[aria-current="true"] {
+  background: var(--fill-strong);
+}
+.round-row .row-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.round-row .row-title span:first-child {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.round-row .meta {
+  font-size: 11px;
+  color: var(--secondary);
+}
+.round-row .meta.warn {
+  color: var(--warn);
+}
+
+.new-badge {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--on-accent);
+  background: var(--accent);
+}
+
+.count {
+  font-weight: 500;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Toolbar ------------------------------------------------------------------------- */
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--separator);
+  min-width: 0;
+}
+[data-platform="macos"] #app.sidebar-hidden #toolbar {
+  padding-left: 84px; /* the traffic lights */
+}
+
+.toolbar-button {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--secondary);
+  -webkit-appearance: none;
+  appearance: none;
+}
+.toolbar-button:active {
+  background: var(--fill-strong);
+}
+.toolbar-button svg.icon {
+  width: 18px;
+  height: 18px;
+  vertical-align: 0;
+}
+
+.toolbar-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+  line-height: 1.2;
+  pointer-events: none; /* drags go to the toolbar */
+}
+.toolbar-title .title {
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toolbar-title .subtitle {
+  font-size: 11px;
+  color: var(--secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.disconnected {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.position {
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chip {
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--secondary);
+  background: var(--fill-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.chip.accent {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  font-weight: 600;
+}
+
+/* ---- Step bar ------------------------------------------------------------------------ */
+
+#steps:empty {
+  display: none;
+}
+#steps {
+  padding: 12px 24px 0;
+}
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+.step {
+  min-width: 28px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--separator);
+  border-radius: 6px;
+  background: var(--fill);
+  color: var(--secondary);
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.step.answered {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.step.current {
+  color: var(--on-accent);
+  border-color: var(--accent);
+  background: var(--accent);
+  font-weight: 600;
+}
+
+/* ---- Page ---------------------------------------------------------------------------- */
+
+#page {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px 24px 24px;
+}
+.column {
+  max-width: 960px;
+  margin: 0 auto;
+  container-type: inline-size;
+}
+
+h1.question {
+  margin: 4px 0 10px;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.body-card {
+  max-height: max(120px, 35vh);
+  overflow-y: auto;
+  margin-bottom: 14px;
+  padding: 2px 14px;
+  border: 1px solid var(--separator);
+  border-radius: 8px;
+  background: var(--fill);
+}
+
+.markdown {
+  cursor: auto;
+}
+.markdown :is(h1, h2, h3, h4) {
+  margin: 12px 0 6px;
+  line-height: 1.25;
+}
+.markdown h1 { font-size: 16px; }
+.markdown h2 { font-size: 15px; }
+.markdown h3,
+.markdown h4 { font-size: 13px; }
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown pre,
+.markdown table,
+.markdown blockquote {
+  margin: 8px 0;
+}
+.markdown ul,
+.markdown ol {
+  padding-left: 22px;
+}
+.markdown code,
+.preview pre,
+kbd {
+  font-family: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+}
+.markdown code {
+  font-size: 0.92em;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--fill-strong);
+}
+.markdown pre {
+  padding: 8px 10px;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--fill-strong);
+}
+.markdown pre code {
+  padding: 0;
+  background: none;
+}
+.markdown table {
+  border-collapse: collapse;
+}
+.markdown th,
+.markdown td {
+  padding: 3px 10px;
+  border: 1px solid var(--separator);
+  text-align: left;
+}
+.markdown th {
+  background: var(--fill);
+}
+.markdown blockquote {
+  padding-left: 10px;
+  border-left: 3px solid var(--separator);
+  color: var(--secondary);
+}
+.markdown a {
+  color: var(--accent);
+  cursor: pointer;
+}
+.markdown hr {
+  border: none;
+  border-top: 1px solid var(--separator);
+}
+
+.recommendation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+.recommendation svg.icon {
+  color: var(--accent);
+}
+
+.open-question {
+  color: var(--secondary);
+  margin: 4px 0;
+}
+
+/* Option cards and the preview panel side by side when there is room. */
+.choices {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+@container (min-width: 720px) {
+  .choices.has-previews {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+@container (max-width: 719px) {
+  .preview.empty {
+    display: none;
+  }
+}
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--separator);
+  border-radius: 8px;
+  background: var(--fill);
+}
+.option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  box-shadow: inset 0 0 0 0.5px var(--accent);
+}
+.option input {
+  flex: none;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+.option-text {
+  min-width: 0;
+  flex: 1;
+}
+.option-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.option-desc {
+  margin-top: 2px;
+  color: var(--secondary);
+}
+
+kbd {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--separator);
+  border-bottom-width: 1.5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 15px;
+  text-align: center;
+  color: var(--secondary);
+  background: var(--content);
+}
+
+.preview {
+  position: sticky;
+  top: 0;
+  padding: 8px 12px 10px;
+  border: 1px solid var(--separator);
+  border-radius: 8px;
+  background: var(--fill);
+}
+.preview-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--secondary);
+}
+.preview-head svg.icon {
+  width: 14px;
+  height: 14px;
+}
+.preview pre {
+  margin: 6px 0 0;
+  max-height: 420px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+}
+.preview .hint {
+  margin: 6px 0 0;
+  color: var(--secondary);
+}
+
+.note {
+  margin-top: 18px;
+}
+.note label {
+  display: block;
+  margin-bottom: 5px;
+  font-weight: 600;
+}
+.note textarea {
+  display: block;
+  width: 100%;
+  min-height: 76px;
+  padding: 6px 8px;
+  resize: vertical;
+  line-height: 1.4;
+  accent-color: var(--accent);
+  cursor: auto;
+}
+
+/* ---- Review page --------------------------------------------------------------------- */
+
+h1.review-title {
+  margin: 4px 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.unanswered-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 10px;
+  color: var(--warn);
+}
+.review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.review-item {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--separator);
+  border-radius: 8px;
+  background: var(--fill);
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.review-item.unanswered {
+  border-color: color-mix(in srgb, var(--warn) 70%, transparent);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+}
+.review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.review-head .ok {
+  color: var(--success);
+}
+.review-head .warn {
+  color: var(--warn);
+}
+.review-head .num {
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+}
+.review-head .q {
+  font-weight: 600;
+}
+.review-answer {
+  margin-top: 4px;
+  padding-left: 22px;
+  white-space: pre-wrap;
+}
+.review-answer.missing {
+  color: var(--warn);
+  font-style: italic;
+}
+.review-note {
+  padding-left: 22px;
+  color: var(--secondary);
+  white-space: pre-wrap;
+}
+
+/* ---- Empty state --------------------------------------------------------------------- */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 70vh;
+  text-align: center;
+  color: var(--secondary);
+}
+.empty-state svg.icon {
+  width: 44px;
+  height: 44px;
+  stroke-width: 1.25;
+  color: var(--tertiary);
+}
+.empty-state h1 {
+  margin: 12px 0 4px;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--label);
+}
+.empty-state p {
+  margin: 0;
+}
+
+/* ---- Footer -------------------------------------------------------------------------- */
+
+#footer:empty {
+  display: none;
+}
+#footer {
+  padding: 10px 20px 8px;
+  border-top: 1px solid var(--separator);
+}
+.footer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.footer-row .spacer {
+  flex: 1;
+}
+.footer-row button {
+  min-width: 84px;
+}
+.hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--secondary);
+}
+.hints span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* The default (primary) push button: WebKit on macOS draws the real one. */
+button.default {
+  -webkit-appearance: default-button;
+}
+@supports not (-webkit-appearance: default-button) {
+  button.default {
+    color: var(--on-accent);
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 5px;
+    padding: 3px 12px;
+  }
+}
+
+/* ---- Settings sheet ------------------------------------------------------------------ */
+
+dialog {
+  width: min(460px, calc(100vw - 40px));
+  margin-top: 0;
+  padding: 20px 22px 18px;
+  border: 1px solid var(--separator);
+  border-top: none;
+  border-radius: 0 0 10px 10px;
+  color: var(--label);
+  background: var(--content);
+  box-shadow: 0 10px 40px rgb(0 0 0 / 25%);
+}
+html:not([data-platform="macos"]) dialog {
+  margin-top: auto;
+  border-top: 1px solid var(--separator);
+  border-radius: 8px;
+}
+dialog::backdrop {
+  background: rgb(0 0 0 / 12%);
+}
+dialog h2 {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 700;
+}
+dialog .secondary {
+  color: var(--secondary);
+  margin: 0 0 14px;
+}
+.small {
+  font-size: 11px;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 10px;
+  align-items: center;
+}
+.form-grid > label:not(.check) {
+  text-align: right;
+}
+.form-grid input[type="text"],
+.form-grid input[type="password"] {
+  width: 100%;
+  cursor: auto;
+}
+.form-grid input.narrow {
+  width: 90px;
+}
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.check input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+#s-warnings > div {
+  display: flex;
+  gap: 5px;
+  margin-top: 10px;
+  color: var(--warn);
+}
+#s-path {
+  margin: 12px 0 0;
+}
+dialog .buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+dialog .buttons button {
+  min-width: 80px;
+}
+/* Windows and Linux put the confirming button first. */
+html:not([data-platform="macos"]) dialog .buttons {
+  flex-direction: row-reverse;
+  justify-content: flex-start;
+}
+
+/* Toolbar text and chips belong to the drag region; only controls take clicks. */
+#toolbar .chip,
+#toolbar .position {
+  pointer-events: none;
+}
