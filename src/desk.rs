@@ -52,24 +52,18 @@ struct State {
     rounds: Vec<Round>,
     /// The id of the selected round.
     selected: Option<String>,
-    /// Where rounds are persisted; `None` keeps them in memory only.
+    /// Where rounds are persisted, fixed at startup; `None` keeps them in memory only.
     store: Option<Store>,
-    /// Keeps other Question Desks out of `store` while it is ours.
+    /// Keeps other Question Desks out of `store` until the quit.
     store_lock: Option<StoreLock>,
     /// The data dir persistence is configured for but cannot use, e.g. because another
-    /// Question Desk uses it; rounds stay in memory meanwhile.
+    /// Question Desk uses it; until the UI took it.
     unavailable: Option<StorageUnavailable>,
-    /// `unavailable` changed and the UI has not been told yet.
-    unavailable_untold: bool,
-    /// The draft writer thread runs (it is started with the first store).
-    writing_drafts: bool,
     /// File writes decided under the lock, carried out once it is released (see
     /// [`Locked`]).
     jobs: Vec<Job>,
     /// The sequence number of the last queued [`Job`].
     last_job: u64,
-    /// Stored rounds left behind when persistence was switched off, to offer deleting.
-    delete_offer: Option<DeleteOffer>,
     /// The filter's terms; open rounds and History show only matching rounds.
     filter: Vec<String>,
 }
@@ -97,11 +91,6 @@ struct Round {
     dirty_since: Option<Instant>,
     /// Agents asking for this Delivered round's result again; never persisted.
     redelivery: Option<Redelivery>,
-    /// The store holding this round's file, if it has one: where it was loaded from or
-    /// last written to. Only this file is ever overwritten or removed for the round.
-    stored_in: Option<Store>,
-    /// Changed since it was last written, e.g. while persistence was off.
-    unsaved: bool,
 }
 
 /// What the user has entered for one Question so far.
@@ -231,8 +220,7 @@ pub enum QuestionState {
 pub struct Attachment {
     ticket: String,
     wait: Wait,
-    /// Counts this call as connected and identifies the round, whose id can change when
-    /// it moves to another data dir; released on drop. `None` for a Re-delivery Request.
+    /// Counts this call as connected and identifies the round; released on drop. `None` for a Re-delivery Request.
     attached: Option<Arc<()>>,
     desk: Desk,
     title: Option<String>,
@@ -327,19 +315,34 @@ struct Redelivery {
     decided_at: Option<Instant>,
 }
 
+/// The MCP client making a call, from its `clientInfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    /// `clientInfo.name`: identifies the client.
+    pub name: String,
+    /// `clientInfo.title`: the display name, if it has one.
+    pub title: Option<String>,
+}
+
+impl Client {
+    fn label(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.name)
+    }
+}
+
 /// An Agent asking for a re-delivery.
 struct Requester {
     /// Who asks, stable across `ask_user_question` and `wait_for_answers`: the client
-    /// name, as `wait_for_answers` carries no `source`.
+    /// name, as titles need not be unique and `wait_for_answers` carries no `source`.
     agent: String,
     /// The Agent Session label to show, with the `source` if the call had one.
     label: String,
 }
 
 impl Requester {
-    fn new(client: Option<&str>, source: Option<&str>) -> Self {
+    fn new(client: Option<&Client>, source: Option<&str>) -> Self {
         Self {
-            agent: session_label(client, None),
+            agent: client.map_or_else(|| UNKNOWN_CLIENT.to_owned(), |c| c.name.clone()),
             label: session_label(client, source),
         }
     }
@@ -407,12 +410,12 @@ impl DiskQueue {
         );
     }
 
-    /// Tries the failed writes again, if they have rested for `delay`.
-    fn retry(&self, delay: Duration) {
-        self.disk
-            .lock()
-            .expect("disk lock is never poisoned")
-            .retry(delay);
+    /// Tries the failed writes again, if they have rested for `delay`; returns how many
+    /// still fail.
+    fn retry(&self, delay: Duration) -> usize {
+        let mut disk = self.disk.lock().expect("disk lock is never poisoned");
+        disk.retry(delay);
+        disk.failed.len()
     }
 }
 
@@ -531,15 +534,6 @@ pub struct StorageUnavailable {
     pub reason: String,
 }
 
-/// The rounds still stored in `data_dir` after persistence was switched off.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteOffer {
-    pub data_dir: PathBuf,
-    pub count: usize,
-    /// The ids of the files counted; only these are deleted.
-    ids: Vec<String>,
-}
-
 /// A pending Re-delivery Request, as the UI shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedeliveryView {
@@ -567,19 +561,27 @@ impl Desk {
     /// empty and keeps its rounds in memory (see [`Desk::take_storage_unavailable`]).
     pub fn with_store(store: Store) -> Self {
         let desk = Desk::default();
-        if !desk.lock().claim(&store) {
-            return desk;
-        }
+        let lock = match store.lock() {
+            Ok(lock) => lock,
+            Err(e) => {
+                log::warn!(
+                    "keeping question rounds in memory only: cannot use {}: {e}",
+                    store.data_dir().display()
+                );
+                desk.lock().unavailable = Some(StorageUnavailable {
+                    data_dir: store.data_dir().to_owned(),
+                    reason: e.to_string(),
+                });
+                return desk;
+            }
+        };
         let loaded = store.load();
         {
             let mut state = desk.lock();
-            for stored in loaded.rounds {
-                let mut round = Round::restore(stored);
-                round.stored_in = Some(store.clone());
-                state.rounds.push(round);
-            }
+            state.rounds = loaded.rounds.into_iter().map(Round::restore).collect();
             state.rounds.sort_by_key(|r| r.opened_at);
             state.store = Some(store);
+            state.store_lock = Some(lock);
             state.select_first_open();
         }
         desk.start_draft_writer();
@@ -587,11 +589,6 @@ impl Desk {
     }
 
     fn start_draft_writer(&self) {
-        let mut state = self.lock();
-        if state.writing_drafts {
-            return;
-        }
-        state.writing_drafts = true;
         let weak = Arc::downgrade(&self.state);
         let disk = self.disk.clone();
         std::thread::Builder::new()
@@ -600,122 +597,14 @@ impl Desk {
             .expect("draft writer thread starts");
     }
 
-    /// Applies changed storage settings at once. Switching persistence off stops all
-    /// writing and keeps the rounds in memory; the stored ones are offered for deletion
-    /// (see [`Desk::take_delete_offer`]). A new data dir gets the rounds in memory, and
-    /// the old one is left untouched. Rounds already stored in the new one are not
-    /// loaded, and its files are never overwritten: a round whose file name is taken
-    /// there is stored under a new id. A data dir another Question Desk uses is not
-    /// written; the next call tries again.
-    pub fn apply_storage(&self, settings: StorageSettings) {
-        let target = settings
-            .data_dir
-            .filter(|_| settings.persistence)
-            .map(Store::new);
-        let mut state = self.lock();
-        if state.store == target {
-            return;
-        }
-        let previous = state.store.take();
-        match target {
-            Some(store) if !state.claim(&store) => {
-                state.store_lock = None;
-                drop(state);
-                if previous.is_some() {
-                    log::info!("persistence switched off");
-                }
-            }
-            None => {
-                state.store_lock = None;
-                state.unavailable = None;
-                drop(state);
-                if let Some(previous) = previous {
-                    log::info!("persistence switched off");
-                    if !settings.persistence {
-                        self.offer_deleting(&previous);
-                    }
-                }
-            }
-            Some(store) => {
-                log::info!("storing question rounds in {}", store.data_dir().display());
-                state.delete_offer = None;
-                state.store = Some(store.clone());
-                state.move_to(&store);
-                drop(state);
-                self.start_draft_writer();
-            }
-        }
-        self.notify(DeskEvent::Changed);
-    }
-
-    /// Why rounds are kept in memory although persistence is on, once per data dir that
-    /// became unavailable.
+    /// Why rounds are kept in memory although persistence is on; told once.
     pub fn take_storage_unavailable(&self) -> Option<StorageUnavailable> {
-        let mut state = self.lock();
-        if !std::mem::take(&mut state.unavailable_untold) {
-            return None;
-        }
-        state.unavailable.clone()
-    }
-
-    /// Offers deleting the rounds stored in `store`, unless persistence is back on.
-    fn offer_deleting(&self, store: &Store) {
-        // Read without holding the desk.
-        let ids: Vec<String> = store.load().rounds.into_iter().map(|r| r.id).collect();
-        let mut state = self.lock();
-        if !ids.is_empty() && state.store.is_none() {
-            state.delete_offer = Some(DeleteOffer {
-                data_dir: store.data_dir().to_owned(),
-                count: ids.len(),
-                ids,
-            });
-        }
-    }
-
-    /// The offer to delete stored rounds after persistence was switched off, once.
-    pub fn take_delete_offer(&self) -> Option<DeleteOffer> {
-        self.lock().delete_offer.take()
-    }
-
-    /// Whether the offer still stands: its data dir is not in use again.
-    pub fn can_delete_stored(&self, offer: &DeleteOffer) -> bool {
-        self.lock().can_delete_stored(offer)
-    }
-
-    /// Deletes the stored rounds counted in an accepted [`DeleteOffer`]; the rounds stay
-    /// in memory for this session. Does nothing once the data dir is in use again.
-    pub fn delete_stored(&self, offer: &DeleteOffer) {
-        let store = Store::new(&offer.data_dir);
-        // Held until the deletions are carried out (it is dropped after `state`): no
-        // Question Desk, this one included, starts using the data dir meanwhile.
-        let dir_lock = store.lock();
-        let mut state = self.lock();
-        if dir_lock.is_err() || !state.can_delete_stored(offer) {
-            log::info!(
-                "not deleting the stored question rounds: {} is in use again",
-                offer.data_dir.display()
-            );
-            return;
-        }
-        for id in &offer.ids {
-            state.queue(&store, id, None);
-        }
-        for round in &mut state.rounds {
-            if round.stored_in.as_ref() == Some(&store) && offer.ids.contains(&round.id) {
-                round.stored_in = None;
-                round.unsaved = true;
-            }
-        }
-        log::info!(
-            "deleting {} stored question round(s) from {}",
-            offer.ids.len(),
-            offer.data_dir.display()
-        );
+        self.lock().unavailable.take()
     }
 
     /// Deletes finished rounds that finished more than `retention_days` ago, from memory
     /// and store; `0` keeps them forever. Open rounds are never pruned, and nothing is
-    /// pruned while persistence is off.
+    /// pruned without a store.
     pub fn prune(&self, retention_days: u32) {
         if retention_days == 0 || !self.is_persistent() {
             return;
@@ -768,8 +657,8 @@ impl Desk {
                 request.decision.send_replace(Some(false));
             }
             let round = state.rounds.remove(i);
-            if let Some(store) = &round.stored_in {
-                state.queue(store, &round.id, None);
+            if let Some(store) = state.store.clone() {
+                state.queue(&store, &round.id, None);
             }
             if state.selected.as_ref() == Some(&round.id) {
                 state.selected = None;
@@ -792,15 +681,16 @@ impl Desk {
     }
 
     /// Writes all unsaved drafts, e.g. on quit, and returns once every write queued so
-    /// far is done, failed ones tried once more.
-    pub fn flush(&self) {
+    /// far is done, failed ones tried once more. Returns how many rounds' latest state
+    /// could still not be written (or removed): it is lost on quit.
+    pub fn flush(&self) -> usize {
         self.lock().write_drafts(Duration::ZERO);
         self.disk.wait_idle();
-        self.disk.retry(Duration::ZERO);
+        self.disk.retry(Duration::ZERO)
     }
 
     /// Writes everything like [`Desk::flush`], then stops storing and lets other Question
-    /// Desks use the data dir: the quit. The rounds stay in memory.
+    /// Desks use the data dir: the quit.
     pub fn close(&self) {
         self.flush();
         let mut state = self.lock();
@@ -860,7 +750,7 @@ impl Desk {
 
     /// Opens a Question Round for a validated `ask_user_question` call, or reattaches to
     /// the round with the same Ticket if its Questions are identical.
-    pub fn ask(&self, input: AskInput, client: Option<String>) -> Result<Attachment, String> {
+    pub fn ask(&self, input: AskInput, client: Option<Client>) -> Result<Attachment, String> {
         let (attachment, event) = self.open_or_reattach(input, client)?;
         self.notify(event);
         Ok(attachment)
@@ -869,10 +759,10 @@ impl Desk {
     fn open_or_reattach(
         &self,
         input: AskInput,
-        client: Option<String>,
+        client: Option<Client>,
     ) -> Result<(Attachment, DeskEvent), String> {
         let mut state = self.lock();
-        let session = session_label(client.as_deref(), input.source.as_deref());
+        let session = session_label(client.as_ref(), input.source.as_deref());
         if let Some(i) = state.holder(&input.ticket) {
             let round = &state.rounds[i];
             if round.delivered_at.is_none() {
@@ -885,7 +775,7 @@ impl Desk {
                 return Ok((round.attach(self), DeskEvent::Changed));
             }
             if round.questions == input.questions {
-                let requester = Requester::new(client.as_deref(), input.source.as_deref());
+                let requester = Requester::new(client.as_ref(), input.source.as_deref());
                 return Ok(state.request_redelivery(i, requester, self));
             }
             // Delivered with other Questions: the Ticket is free for a new round.
@@ -908,8 +798,6 @@ impl Desk {
             seen: false,
             dirty_since: None,
             redelivery: None,
-            stored_in: None,
-            unsaved: true,
         });
         let last = state.rounds.len() - 1;
         state.save(last);
@@ -922,13 +810,13 @@ impl Desk {
 
     /// Attaches to the round with this Ticket, open or finished; `None` if unknown.
     /// A Delivered round raises a Re-delivery Request from `client` instead.
-    pub fn pickup(&self, ticket: &str, client: Option<String>) -> Option<Attachment> {
+    pub fn pickup(&self, ticket: &str, client: Option<Client>) -> Option<Attachment> {
         let mut state = self.lock();
         let i = state.holder(ticket)?;
         if state.rounds[i].delivered_at.is_none() {
             return Some(state.rounds[i].attach(self));
         }
-        let requester = Requester::new(client.as_deref(), None);
+        let requester = Requester::new(client.as_ref(), None);
         let (attachment, event) = state.request_redelivery(i, requester, self);
         drop(state);
         self.notify(event);
@@ -1306,39 +1194,6 @@ impl Desk {
 }
 
 impl State {
-    /// Takes `store`'s data dir for this desk; `false` (and remembered for the UI) if
-    /// another Question Desk uses it or it cannot be locked.
-    fn claim(&mut self, store: &Store) -> bool {
-        match store.lock() {
-            Ok(lock) => {
-                self.store_lock = Some(lock);
-                self.unavailable = None;
-                true
-            }
-            Err(e) => {
-                let unavailable = StorageUnavailable {
-                    data_dir: store.data_dir().to_owned(),
-                    reason: e.to_string(),
-                };
-                if self.unavailable.as_ref() != Some(&unavailable) {
-                    log::warn!(
-                        "keeping question rounds in memory only: cannot use {}: {e}",
-                        unavailable.data_dir.display()
-                    );
-                    self.unavailable = Some(unavailable);
-                    self.unavailable_untold = true;
-                }
-                false
-            }
-        }
-    }
-
-    fn can_delete_stored(&self, offer: &DeleteOffer) -> bool {
-        self.store
-            .as_ref()
-            .is_none_or(|s| s.data_dir() != offer.data_dir)
-    }
-
     fn select_first_open(&mut self) {
         let next = self.rounds.iter_mut().find(|r| r.is_open());
         self.selected = next.map(|round| {
@@ -1441,44 +1296,13 @@ impl State {
             .expect("some suffix is free")
     }
 
-    /// Writes the rounds to `store`, the new store: those it holds already only if they
-    /// changed, the others under an id whose file name is free there.
-    fn move_to(&mut self, store: &Store) {
-        for i in 0..self.rounds.len() {
-            let round = &self.rounds[i];
-            if round.stored_in.as_ref() == Some(store) {
-                if round.unsaved {
-                    self.save(i);
-                }
-                continue;
-            }
-            if store.exists(&round.id) {
-                // Another round's file, or one this build must not touch.
-                let id = self.new_id(&round.ticket.clone());
-                log::info!(
-                    "storing question round {:?} as {id:?}: its file name is taken in {}",
-                    self.rounds[i].id,
-                    store.data_dir().display()
-                );
-                if self.selected.as_ref() == Some(&self.rounds[i].id) {
-                    self.selected = Some(id.clone());
-                }
-                self.rounds[i].id = id;
-            }
-            self.save(i);
-        }
-    }
-
     /// Queues writing round `i` to the store, if there is one.
     fn save(&mut self, i: usize) {
         let round = &mut self.rounds[i];
         round.dirty_since = None;
         let Some(store) = self.store.clone() else {
-            round.unsaved = true;
             return;
         };
-        round.stored_in = Some(store.clone());
-        round.unsaved = false;
         let (id, stored) = (round.id.clone(), round.to_stored());
         self.queue(&store, &id, Some(stored));
     }
@@ -1635,8 +1459,6 @@ impl Round {
             seen: true,
             dirty_since: None,
             redelivery: None,
-            stored_in: None,
-            unsaved: false,
         };
         let outcome = match stored.status {
             store::Status::Open => None,
@@ -1713,8 +1535,11 @@ fn question_result(question: &Question, draft: &Draft) -> QuestionResult {
     }
 }
 
-fn session_label(client: Option<&str>, source: Option<&str>) -> String {
-    let client = client.unwrap_or("Unknown client");
+const UNKNOWN_CLIENT: &str = "Unknown client";
+
+/// The Agent Session label: the client's display name, plus the call's `source`.
+fn session_label(client: Option<&Client>, source: Option<&str>) -> String {
+    let client = client.map_or(UNKNOWN_CLIENT, Client::label);
     match source {
         Some(source) => format!("{client} · {source}"),
         None => client.to_owned(),
@@ -1734,6 +1559,13 @@ fn system_time(timestamp: jiff::Timestamp) -> SystemTime {
 mod tests {
     use super::*;
 
+    fn client(name: &str) -> Client {
+        Client {
+            name: name.into(),
+            title: None,
+        }
+    }
+
     #[tokio::test]
     async fn a_decision_expires_for_listed_agents_after_the_grace() {
         let desk = Desk::default();
@@ -1742,11 +1574,11 @@ mod tests {
             "questions": [{ "question": "Which database?", "header": "Database" }]
         }))
         .unwrap();
-        let mut asked = desk.ask(input, Some("claude".into())).unwrap();
+        let mut asked = desk.ask(input, Some(client("claude"))).unwrap();
         desk.submit();
         asked.finished().await.unwrap();
 
-        drop(desk.pickup("db-1", Some("codex".into())).unwrap());
+        drop(desk.pickup("db-1", Some(client("codex"))).unwrap());
         let id = desk.redeliveries()[0].id.clone();
         desk.deliver_again(&id);
         desk.lock().rounds[0]
@@ -1755,7 +1587,7 @@ mod tests {
             .unwrap()
             .decided_at = Some(Instant::now() - REDELIVERY_GRACE);
 
-        let late = desk.pickup("db-1", Some("codex".into())).unwrap();
+        let late = desk.pickup("db-1", Some(client("codex"))).unwrap();
         assert_eq!(desk.redeliveries().len(), 1, "asked again");
         assert!(late.is_redelivery());
     }

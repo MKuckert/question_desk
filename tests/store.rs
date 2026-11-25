@@ -128,3 +128,14 @@ fn only_the_owner_may_read_the_store() {
     assert_eq!(mode(&store.rounds_dir()), 0o700);
     assert_eq!(mode(&store.rounds_dir().join("db-1.json")), 0o600);
 }
+
+#[test]
+fn a_round_no_agent_could_have_asked_is_unreadable() {
+    let mut empty = round("empty");
+    empty.questions.clear();
+    empty.answers.clear();
+    assert!(matches!(
+        store::from_json(&store::to_json(&empty)),
+        Err(LoadError::Unreadable(e)) if e.contains("at least one question")
+    ));
+}

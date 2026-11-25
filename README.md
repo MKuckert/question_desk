@@ -54,7 +54,7 @@ retention_days = 90         # default; finished rounds are deleted this long aft
 data_dir = "~/rounds"       # default: ~/.local/share/question-desk ($XDG_DATA_HOME), Windows: the app data dir
 ```
 
-These settings apply without a restart: when you save them in Settings, and when you edit `config.toml` by hand and switch back to the window. Pruning runs at startup and once a day. Changing `data_dir` writes the current rounds to the new folder and leaves the old one as it is. Only one Question Desk uses a `data_dir` at a time: a second one keeps its rounds in memory only and tells you so.
+`persistence` and `data_dir` take effect when Question Desk starts; after changing them, restart it (open rounds survive the restart when stored). `retention_days` applies at once: pruning runs at startup, once a day, and when you save Settings, re-reading `config.toml` first. Changing `data_dir` starts with the rounds stored in the new folder; the old one is left as it is. Only one Question Desk uses a `data_dir` at a time: a second one keeps its rounds in memory only and tells you so.
 
 ## Connect Claude Code
 

@@ -1,6 +1,5 @@
-//! Keeping the store in line with `config.toml`: re-read the config, apply its storage
-//! settings and prune old rounds. Runs at startup, daily, and when the window gains focus
-//! (ADR 0007); there is no file watcher.
+//! Pruning old rounds: re-read the retention from `config.toml` and prune. Runs at startup
+//! and daily (ADR 0007); there is no file watcher. Storage settings apply at startup only.
 
 use std::{path::Path, time::Duration};
 
@@ -9,11 +8,10 @@ use crate::{config, desk::Desk};
 /// How often the store is pruned while the app runs.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Reads the config at `path`, applies its storage settings to `desk` and prunes. A
-/// config that cannot be read changes nothing.
+/// Reads the config at `path` and prunes with its retention. A config that cannot be
+/// read prunes nothing.
 pub fn run(desk: &Desk, path: &Path) -> Result<(), String> {
     let config = config::load_from(path)?;
-    desk.apply_storage(config.storage());
     desk.prune(config.retention_days);
     Ok(())
 }

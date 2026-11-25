@@ -164,21 +164,17 @@ async fn a_failed_write_is_tried_again_until_it_succeeds() {
     std::fs::create_dir(&file).unwrap();
     std::fs::write(file.join("blocker"), "").unwrap();
     h.desk.set_note("draft");
-    h.desk.flush();
-    assert!(file.is_dir(), "the write failed");
+    assert_eq!(h.desk.flush(), 1, "one round is not written");
+    assert!(file.is_dir());
 
     std::fs::remove_dir_all(&file).unwrap();
-    h.desk.flush();
+    assert_eq!(h.desk.flush(), 0);
     assert!(std::fs::read_to_string(&file).unwrap().contains("draft"));
 }
 
 #[tokio::test]
 async fn a_second_desk_on_the_same_data_dir_keeps_its_rounds_in_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let settings = question_desk::desk::StorageSettings {
-        persistence: true,
-        data_dir: Some(dir.path().to_owned()),
-    };
     let first = start_in(dir.path()).await;
     let second = start_in(dir.path()).await;
     assert!(!second.desk.is_persistent());
@@ -192,15 +188,10 @@ async fn a_second_desk_on_the_same_data_dir_keeps_its_rounds_in_memory() {
     second.desk.flush();
     let file = dir.path().join("rounds").join("db-1.json");
     assert!(!file.exists(), "the second desk writes nothing");
-    second.desk.apply_storage(settings.clone());
-    assert!(
-        second.desk.take_storage_unavailable().is_none(),
-        "told once, not on every settings check"
-    );
 
-    // Once the first one quits, the next settings check takes the data dir.
+    // Once the first one quits, the data dir is free for the next start.
     first.desk.close();
-    second.desk.apply_storage(settings);
-    assert!(second.desk.is_persistent());
-    assert!(file.exists());
+    drop(first);
+    let third = start_in(dir.path()).await;
+    assert!(third.desk.is_persistent());
 }

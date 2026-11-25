@@ -30,8 +30,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::{
-    desk::Attachment,
     desk::Desk,
+    desk::{Attachment, Client},
     format::{self, RoundResult},
     schema::{self, AskInput, Output, WaitInput},
 };
@@ -312,10 +312,10 @@ impl Handler {
         };
         // Only the per-request `_meta` identifies the client; in stateless mode the peer
         // info is a placeholder (ADR 0001).
-        let client = context
-            .meta
-            .client_info()
-            .map(|c| c.title.unwrap_or(c.name));
+        let client = context.meta.client_info().map(|c| Client {
+            name: c.name,
+            title: c.title,
+        });
         let mut attachment = match self.desk.ask(input, client) {
             Ok(attachment) => attachment,
             Err(e) => return tool_error(e),
@@ -335,10 +335,10 @@ impl Handler {
             Ok(input) => input,
             Err(e) => return tool_error(e),
         };
-        let client = context
-            .meta
-            .client_info()
-            .map(|c| c.title.unwrap_or(c.name));
+        let client = context.meta.client_info().map(|c| Client {
+            name: c.name,
+            title: c.title,
+        });
         let Some(mut attachment) = self.desk.pickup(&input.ticket, client) else {
             return tool_error(format!(
                 "unknown ticket {:?}: the Question Desk has no question round with this ticket",

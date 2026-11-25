@@ -94,7 +94,8 @@ pub fn to_json(round: &StoredRound) -> String {
     text
 }
 
-/// Parses a round file, migrating older versions.
+/// Parses a round file, migrating older versions. Questions an Agent could not have asked
+/// (e.g. none at all) make it unreadable.
 pub fn from_json(text: &str) -> Result<StoredRound, LoadError> {
     let mut value: serde_json::Value =
         serde_json::from_str(text).map_err(|e| LoadError::Unreadable(e.to_string()))?;
@@ -109,7 +110,10 @@ pub fn from_json(text: &str) -> Result<StoredRound, LoadError> {
         return Err(LoadError::Newer(version));
     }
     let value = migrate(version, value)?;
-    serde_json::from_value(value).map_err(|e| LoadError::Unreadable(e.to_string()))
+    let round: StoredRound =
+        serde_json::from_value(value).map_err(|e| LoadError::Unreadable(e.to_string()))?;
+    crate::schema::validate_questions(&round.questions).map_err(LoadError::Unreadable)?;
+    Ok(round)
 }
 
 /// Lifts a file of `version` to the current format, one version at a time.

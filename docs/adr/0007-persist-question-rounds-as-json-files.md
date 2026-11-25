@@ -21,7 +21,7 @@ The server cannot know whether an Agent *saw* a result: Claude Code backgrounds 
 
 **Format evolution.** Each file carries a `version`; older versions are migrated in memory on load. Unparseable files and files from a newer version are skipped in place with a warning. They are never modified or pruned.
 
-**Retention.** Finished rounds are pruned `retention_days` (default 90, `0` = forever) after they finished. Pruning runs at startup and then daily, and re-reads `config.toml` first. Open rounds are never pruned. `data_dir` and a persistence on/off switch are also settings.
+**Retention.** Finished rounds are pruned `retention_days` (default 90, `0` = forever) after they finished. Pruning runs at startup and then daily, and re-reads `config.toml` first. Open rounds are never pruned. `data_dir` and a persistence on/off switch are also settings; both take effect at the next start only, so the desk uses one store (or none) for its whole run.
 
 **Ticket release on Delivery.** A finished round is *Delivered* once its result was written to an HTTP response; this releases its Ticket. After that:
 - `ask_user_question` with the Ticket and **different** Questions opens a new round. The old one stays in History.
@@ -44,4 +44,4 @@ After a restart, restored open rounds have no attached call and show as disconne
 - Answers now rest on disk. Owner-only permissions, retention, delete/clear-all and the persistence switch are the privacy controls; there is no encryption at rest.
 - Results are delivered at most once without asking. A resumed Agent session that lost its result needs one confirmation click.
 - The glossary gains *History*, *Delivered*, *Awaiting Pickup*, *Re-delivery Request*. Ticket and Pickup are revised.
-- `config.toml` is re-read when the window gains focus and before pruning, so persistence settings apply live without a file watcher. Server settings still need a restart.
+- `config.toml` is re-read before pruning, so a changed retention applies without a restart. Storage settings need one: switching store at runtime meant moving rounds between folders, offering to delete what was left behind, and tracking which folder each round's file lives in, and each of those raced with a second instance taking the folder. A restart is cheap because open rounds survive it.

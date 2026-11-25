@@ -25,8 +25,8 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use crate::{
     config::{self, Config},
     desk::{
-        DeleteOffer, Desk, DeskEvent, FinishedView, HistoryEntry, OptionView, QuestionState,
-        QuestionView, RedeliveryView, RoundSummary, RoundView, SessionView, Step,
+        Desk, DeskEvent, FinishedView, HistoryEntry, OptionView, QuestionState, QuestionView,
+        RedeliveryView, RoundSummary, RoundView, SessionView, Step, StorageSettings,
     },
     format::Outcome,
     server::{DEFAULT_HOST, DEFAULT_PORT, ServerControl},
@@ -98,13 +98,13 @@ pub fn run(
             Ok(Box::new(App {
                 desk,
                 server,
+                storage: config.storage(),
                 config,
                 status,
                 attention,
                 restore_window_level: false,
                 sidebar_open: true,
                 history_open: false,
-                focused: false,
                 filter: String::new(),
                 export: None,
                 notice: None,
@@ -139,13 +139,13 @@ enum Dialog {
     Cancel,
     SubmitUnanswered,
     Close,
+    /// Quit although this many rounds could not be written to disk?
+    CloseUnsaved(usize),
     /// Delete the round with this id.
     DeleteRound(String),
     /// Delete every round of the Agent Session with this label.
     DeleteSession(String),
     ClearHistory,
-    /// Persistence was switched off; delete what is stored, too?
-    DeleteStored(DeleteOffer),
 }
 
 struct App {
@@ -153,6 +153,8 @@ struct App {
     server: ServerControl,
     /// The settings the server runs with.
     config: Config,
+    /// The storage settings the desk runs with: read at startup, applied by a restart.
+    storage: StorageSettings,
     /// Shown in the empty state: the MCP URL or why the server is not running.
     status: String,
     /// Set by the desk when a new round arrives.
@@ -162,8 +164,6 @@ struct App {
     sidebar_open: bool,
     /// The History section is expanded; collapsed, only its header shows at the bottom.
     history_open: bool,
-    /// The window had the focus last frame.
-    focused: bool,
     /// The sidebar's filter query, as typed.
     filter: String,
     /// The id of the round to export after this frame.
@@ -211,11 +211,6 @@ impl App {
     fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.zoom = Some(ctx.zoom_factor());
-        let focused = ctx.input(|i| i.focused);
-        if focused && !self.focused {
-            self.reload_storage_settings();
-        }
-        self.focused = focused;
         self.request_attention(&ctx);
         self.handle_close_request(&ctx);
 
@@ -280,17 +275,6 @@ impl App {
         if !self.modal_open() && ctx.input_mut(|i| i.consume_shortcut(&FILTER_SHORTCUT)) {
             self.sidebar_open = true;
             ctx.memory_mut(|m| m.request_focus(filter_id()));
-        }
-        if let Some(Dialog::DeleteStored(offer)) = &self.dialog
-            && !self.desk.can_delete_stored(offer)
-        {
-            // Persistence is back on for that folder: nothing to delete any more.
-            self.dialog = None;
-        }
-        if self.dialog.is_none()
-            && let Some(offer) = self.desk.take_delete_offer()
-        {
-            self.dialog = Some(Dialog::DeleteStored(offer));
         }
         if self.notice.is_none()
             && let Some(unavailable) = self.desk.take_storage_unavailable()
@@ -360,21 +344,6 @@ impl App {
         }
     }
 
-    /// Picks up hand edits of the storage settings in `config.toml`. Server settings
-    /// need a restart (or the settings dialog) to apply.
-    fn reload_storage_settings(&mut self) {
-        let Some(path) = config::path() else { return };
-        match config::load_from(&path) {
-            Ok(edited) => {
-                self.config.retention_days = edited.retention_days;
-                self.config.data_dir = edited.data_dir.clone();
-                self.config.persistence = edited.persistence;
-                self.desk.apply_storage(edited.storage());
-            }
-            Err(e) => log::warn!("not applying the edited settings: {e}"),
-        }
-    }
-
     fn modal_open(&self) -> bool {
         self.dialog.is_some() || self.settings.is_some() || self.notice.is_some()
     }
@@ -402,15 +371,23 @@ impl App {
     }
 
     /// With a store, open rounds survive the quit; without one, closing cancels them,
-    /// so the user confirms first.
+    /// so the user confirms first. Changes that cannot be written are confirmed, too.
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        if !self.closing && !self.desk.is_persistent() && self.desk.has_open() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Some(Dialog::Close);
-            return;
+        if !self.closing {
+            let dialog = if !self.desk.is_persistent() {
+                self.desk.has_open().then_some(Dialog::Close)
+            } else {
+                let failed = self.desk.flush();
+                (failed > 0).then_some(Dialog::CloseUnsaved(failed))
+            };
+            if dialog.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.dialog = dialog;
+                return;
+            }
         }
         self.desk.close();
     }
@@ -1273,6 +1250,15 @@ impl App {
                 ),
                 "Submit anyway",
             ),
+            Dialog::CloseUnsaved(failed) => (
+                "Quit without saving?",
+                format!(
+                    "The latest changes to {failed} round(s) could not be written to disk, \
+                     e.g. because it is full; they are lost when you quit. Free up space \
+                     and close again to retry."
+                ),
+                "Quit anyway",
+            ),
             Dialog::Close => (
                 "Close the Question Desk?",
                 "All open rounds are cancelled; their Agents receive the answers given so far."
@@ -1316,20 +1302,10 @@ impl App {
                 ),
                 "Clear History",
             ),
-            Dialog::DeleteStored(offer) => (
-                "Also delete the stored rounds?",
-                format!(
-                    "Rounds are no longer written to disk. {} round(s) are still stored in {}; \
-                     they stay visible until you quit.",
-                    offer.count,
-                    home_relative(&offer.data_dir)
-                ),
-                "Delete",
-            ),
         };
         let dismiss = match &dialog {
             Dialog::Cancel | Dialog::SubmitUnanswered | Dialog::Close => "Keep answering",
-            Dialog::DeleteStored(_) => "Keep",
+            Dialog::CloseUnsaved(_) => "Keep open",
             _ => "Cancel",
         };
         let mut decision = None;
@@ -1372,6 +1348,10 @@ impl App {
                 match dialog {
                     Dialog::Cancel => self.desk.cancel(),
                     Dialog::SubmitUnanswered => self.desk.submit(),
+                    Dialog::CloseUnsaved(_) => {
+                        self.closing = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                     Dialog::Close => {
                         self.desk.cancel_all();
                         self.closing = true;
@@ -1380,7 +1360,6 @@ impl App {
                     Dialog::DeleteRound(id) => self.desk.delete(&id),
                     Dialog::DeleteSession(label) => self.desk.delete_session(&label),
                     Dialog::ClearHistory => self.desk.clear_history(),
-                    Dialog::DeleteStored(offer) => self.desk.delete_stored(&offer),
                 }
             }
             Some(false) => self.dialog = None,
@@ -1505,6 +1484,15 @@ impl App {
                     }
                     warnings.push(warning);
                 }
+                if form
+                    .config()
+                    .is_ok_and(|config| config.storage() != self.storage)
+                {
+                    warnings.push(
+                        "Stored rounds: restart Question Desk to use the changed settings."
+                            .to_owned(),
+                    );
+                }
                 warnings.extend(form.error.clone());
                 for warning in warnings {
                     ui.add_space(SPACE_S);
@@ -1581,7 +1569,7 @@ impl App {
             self.status = server_status(result);
         }
         self.config = config.clone();
-        self.desk.apply_storage(config.storage());
+        // Storage settings wait for the restart; the retention applies at once.
         self.desk.prune(config.retention_days);
         match config::save(&config) {
             Ok(path) => {

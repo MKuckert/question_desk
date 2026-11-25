@@ -263,3 +263,21 @@ async fn a_decision_on_an_ask_with_a_source_answers_the_same_agents_poll() {
     assert_eq!(again.is_error, Some(true), "declined, not a new request");
     assert!(h.desk.redeliveries().is_empty());
 }
+
+#[tokio::test]
+async fn clients_sharing_a_title_are_still_told_apart() {
+    let h = start().await;
+    delivered(&h, db_round("db-1")).await;
+    let codex = h.agent_as(agent_named("codex", Some("Coder"))).await;
+    poll(&codex).await;
+    h.desk.deliver_again(&requested(&h).await.id);
+
+    let other = h.agent_as(agent_named("other", Some("Coder"))).await;
+    let pending = poll(&other).await;
+    assert_eq!(
+        pending.structured_content.unwrap()["status"],
+        json!("pending"),
+        "asked again, not given codex's decision"
+    );
+    assert_eq!(requested(&h).await.requesters, vec!["Coder".to_owned()]);
+}
